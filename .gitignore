@@ -1,0 +1,12 @@
+# 编译产物
+*.exe
+*.test
+/bin/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
