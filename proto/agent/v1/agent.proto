@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package agent.v1;
+
+option go_package = "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1;agentv1";
+
+service AgentService {
+  rpc Run(RunRequest) returns (RunResponse);
+}
+
+message RunRequest {
+  string session_id   = 1;
+  string user_message = 2;
+  int32  max_turns    = 3;
+}
+
+message RunResponse {
+  string session_id     = 1;
+  string final_response = 2;
+  bool   completed      = 3;
+  int32  used_turns     = 4;
+}
