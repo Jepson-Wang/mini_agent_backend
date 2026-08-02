@@ -33,3 +33,15 @@ func (r *UserRepo) GetByEmail(ctx context.Context, email string) (*model.User, e
 	}
 	return &u, nil
 }
+
+func (r *UserRepo) GetByID(ctx context.Context, id string) (*model.User, error) {
+	var u model.User
+	err := r.db.WithContext(ctx).Where("id = ?", id).First(&u).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, model.ErrUserNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
