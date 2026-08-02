@@ -1,0 +1,8 @@
+server:
+  addr: ":8080"
+
+database:
+  dsn: "host=localhost user=postgres password=123456 dbname=mini_agent_backend port=5432 sslmode=disable"
+
+agent:
+  addr: "localhost:50051"
