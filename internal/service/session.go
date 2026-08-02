@@ -28,14 +28,14 @@ func (s *SessionService) CreateWithFirstTask(ctx context.Context,
 	}
 
 	var sess *model.Session
-	var task *model.Task
+	task := &model.Task{TaskUID: taskUID, UserID: userID, Input: input}
 	err = s.repo.Transaction(ctx, func(r *repository.Repository) error {
 		var err error
 		if sess, err = r.Session.Create(ctx, userID, title); err != nil {
 			return err // 已翻译成 ErrUserNotFound / ErrSessionExists
 		}
-		task, err = r.Task.Create(ctx, taskUID, sess.SessionID, userID, input)
-		return err
+		task.SessionID = sess.SessionID // 会话建出来才知道
+		return r.Task.Create(ctx, task)
 	})
 	if err != nil {
 		return nil, nil, err

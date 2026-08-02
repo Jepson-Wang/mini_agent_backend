@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ptr"
@@ -78,6 +79,31 @@ func mustUser(t *testing.T, r *Repository) *model.User {
 		t.Fatalf("准备用户数据失败: %v", err)
 	}
 	return u
+}
+
+func mustSession(t *testing.T, r *Repository, userID int64) *model.Session {
+	t.Helper()
+	s, err := r.Session.Create(context.Background(), userID, nil)
+	if err != nil {
+		t.Fatalf("准备会话数据失败: %v", err)
+	}
+	return s
+}
+
+// mustTask 造一个任务。createdAt 传零值就用当前时间。
+// 需要断言排序的用例请显式传时间 —— time.Now() 在 Windows 上分辨率不够,
+// 连着建两条可能拿到同一个微秒值,顺序就不确定了。
+func mustTask(t *testing.T, r *Repository, sess *model.Session, userID int64, createdAt time.Time) *model.Task {
+	t.Helper()
+	uid, err := ulid.New()
+	if err != nil {
+		t.Fatalf("生成 task_uid: %v", err)
+	}
+	task := &model.Task{TaskUID: uid, SessionID: sess.SessionID, UserID: userID, CreatedAt: createdAt}
+	if err := r.Task.Create(context.Background(), task); err != nil {
+		t.Fatalf("准备任务数据失败: %v", err)
+	}
+	return task
 }
 
 // ---- UserRepo ----
@@ -224,8 +250,8 @@ func TestTaskRepo_MarkSucceeded_LateCallback(t *testing.T) {
 		if err != nil {
 			t.Fatalf("生成 task_uid: %v", err)
 		}
-		task, err := r.Task.Create(ctx, taskUID, sess.SessionID, u.ID, ptr.To("你好"))
-		if err != nil {
+		task := &model.Task{TaskUID: taskUID, SessionID: sess.SessionID, UserID: u.ID, Input: ptr.To("你好")}
+		if err := r.Task.Create(ctx, task); err != nil {
 			t.Fatalf("创建任务: %v", err)
 		}
 		if task.Status != "pending" {
@@ -249,6 +275,164 @@ func TestTaskRepo_MarkSucceeded_LateCallback(t *testing.T) {
 		}
 		if ok {
 			t.Error("重复标记应该返回 false(迟到的回调)")
+		}
+	})
+}
+
+// MarkRunning 只认 pending,已经在跑的任务不该被重复推进。
+func TestTaskRepo_MarkRunning_OnlyFromPending(t *testing.T) {
+	withTx(t, func(t *testing.T, r *Repository) {
+		ctx := context.Background()
+		u := mustUser(t, r)
+		task := mustTask(t, r, mustSession(t, r, u.ID), u.ID, time.Time{})
+
+		ok, err := r.Task.MarkRunning(ctx, task.TaskUID)
+		if err != nil {
+			t.Fatalf("首次标记运行中: %v", err)
+		}
+		if !ok {
+			t.Fatal("pending 的任务应该能推到 running")
+		}
+
+		got, err := r.Task.GetByUID(ctx, task.TaskUID)
+		if err != nil {
+			t.Fatalf("查询任务: %v", err)
+		}
+		if got.Status != "running" {
+			t.Errorf("状态应为 running,实际是 %q", got.Status)
+		}
+		if got.StartedAt == nil {
+			t.Error("StartedAt 应该被填上")
+		}
+		if got.FinishedAt != nil {
+			t.Error("还没结束,FinishedAt 应为 nil")
+		}
+
+		ok, err = r.Task.MarkRunning(ctx, task.TaskUID)
+		if err != nil {
+			t.Fatalf("重复标记不该报错: %v", err)
+		}
+		if ok {
+			t.Error("已经是 running 了,应该返回 false")
+		}
+	})
+}
+
+// running -> failed,顺带验证 ErrorMsg 这个可空字段的往返。
+func TestTaskRepo_MarkFailed(t *testing.T) {
+	withTx(t, func(t *testing.T, r *Repository) {
+		ctx := context.Background()
+		u := mustUser(t, r)
+		task := mustTask(t, r, mustSession(t, r, u.ID), u.ID, time.Time{})
+
+		if _, err := r.Task.MarkRunning(ctx, task.TaskUID); err != nil {
+			t.Fatalf("标记运行中: %v", err)
+		}
+
+		ok, err := r.Task.MarkFailed(ctx, task.TaskUID, ptr.To("模型超时"))
+		if err != nil {
+			t.Fatalf("标记失败: %v", err)
+		}
+		if !ok {
+			t.Fatal("running 的任务应该能推到 failed")
+		}
+
+		got, err := r.Task.GetByUID(ctx, task.TaskUID)
+		if err != nil {
+			t.Fatalf("查询任务: %v", err)
+		}
+		if got.Status != "failed" {
+			t.Errorf("状态应为 failed,实际是 %q", got.Status)
+		}
+		if got.ErrorMsg == nil || *got.ErrorMsg != "模型超时" {
+			t.Errorf("ErrorMsg 没有正确往返,实际是 %v", got.ErrorMsg)
+		}
+		if got.FinishedAt == nil {
+			t.Error("FinishedAt 应该被填上")
+		}
+
+		// failed 是终态,不能再被标记成功
+		if ok, err := r.Task.MarkSucceeded(ctx, task.TaskUID); err != nil || ok {
+			t.Errorf("终态不该被推翻,ok=%v err=%v", ok, err)
+		}
+	})
+}
+
+func TestTaskRepo_GetByUID_NotFound(t *testing.T) {
+	withTx(t, func(t *testing.T, r *Repository) {
+		_, err := r.Task.GetByUID(context.Background(), "00000000000000000000000000")
+		if !errors.Is(err, model.ErrTaskNotFound) {
+			t.Fatalf("期望 ErrTaskNotFound,实际是 %v", err)
+		}
+	})
+}
+
+func TestTaskRepo_ListBySession(t *testing.T) {
+	withTx(t, func(t *testing.T, r *Repository) {
+		ctx := context.Background()
+		u := mustUser(t, r)
+		sess := mustSession(t, r, u.ID)
+		other := mustSession(t, r, u.ID)
+
+		now := time.Now()
+		oldest := mustTask(t, r, sess, u.ID, now.Add(-2*time.Minute))
+		middle := mustTask(t, r, sess, u.ID, now.Add(-time.Minute))
+		newest := mustTask(t, r, sess, u.ID, now)
+		mustTask(t, r, other, u.ID, now) // 别的会话,不该被捞出来
+
+		list, err := r.Task.ListBySession(ctx, sess.SessionID, 10, 0)
+		if err != nil {
+			t.Fatalf("列出任务: %v", err)
+		}
+		if len(list) != 3 {
+			t.Fatalf("期望 3 个任务,实际 %d 个", len(list))
+		}
+		want := []string{newest.TaskUID, middle.TaskUID, oldest.TaskUID}
+		for i, uid := range want {
+			if list[i].TaskUID != uid {
+				t.Errorf("第 %d 条应为 %s,实际是 %s(排序应按 created_at 倒序)", i, uid, list[i].TaskUID)
+			}
+		}
+
+		page, err := r.Task.ListBySession(ctx, sess.SessionID, 2, 1)
+		if err != nil {
+			t.Fatalf("分页列出任务: %v", err)
+		}
+		if len(page) != 2 || page[0].TaskUID != middle.TaskUID || page[1].TaskUID != oldest.TaskUID {
+			t.Errorf("limit=2 offset=1 的结果不对: %+v", page)
+		}
+	})
+}
+
+func TestTaskRepo_CountByUserSince(t *testing.T) {
+	withTx(t, func(t *testing.T, r *Repository) {
+		ctx := context.Background()
+		u := mustUser(t, r)
+		sess := mustSession(t, r, u.ID)
+
+		now := time.Now()
+		mustTask(t, r, sess, u.ID, now.Add(-2*time.Hour))
+		mustTask(t, r, sess, u.ID, now.Add(-30*time.Minute))
+		mustTask(t, r, sess, u.ID, now)
+
+		// 另一个用户的任务不该算进来
+		other := mustUser(t, r)
+		mustTask(t, r, mustSession(t, r, other.ID), other.ID, now)
+
+		n, err := r.Task.CountByUserSince(ctx, u.ID, now.Add(-time.Hour))
+		if err != nil {
+			t.Fatalf("统计任务数: %v", err)
+		}
+		if n != 2 {
+			t.Errorf("最近一小时应有 2 个任务,实际 %d 个", n)
+		}
+
+		n, err = r.Task.CountByUserSince(ctx, u.ID, now.Add(time.Minute))
+		if err != nil {
+			t.Fatalf("统计任务数: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("未来时间点应统计到 0 个,实际 %d 个", n)
 		}
 	})
 }
