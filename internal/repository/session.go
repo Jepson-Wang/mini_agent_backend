@@ -42,3 +42,19 @@ func (r *SessionRepo) ListByUser(ctx context.Context, userID int64, limit, offse
 		Find(&ss).Error
 	return ss, err
 }
+
+func (r *SessionRepo) GetByID(ctx context.Context, SessionID string) (*model.Session, error) {
+	var ss model.Session
+	err := r.db.WithContext(ctx).Where("session_id = ?", SessionID).First(&ss).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, model.ErrSessionNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &ss, nil
+}
+
+func (r *SessionRepo) softDelete(ctx context.Context, sessionID string) error {
+	return r.db.WithContext(ctx).Delete(&model.Session{SessionID: sessionID}).Error
+}
