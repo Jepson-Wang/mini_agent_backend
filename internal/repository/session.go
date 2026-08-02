@@ -55,6 +55,6 @@ func (r *SessionRepo) GetByID(ctx context.Context, SessionID string) (*model.Ses
 	return &ss, nil
 }
 
-func (r *SessionRepo) softDelete(ctx context.Context, sessionID string) error {
+func (r *SessionRepo) SoftDelete(ctx context.Context, sessionID string) error {
 	return r.db.WithContext(ctx).Delete(&model.Session{SessionID: sessionID}).Error
 }
