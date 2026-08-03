@@ -78,6 +78,10 @@ var errRules = []errRule{
 	// 否则接口就成了账号探测器。model.ErrEmailOccupied 的文案也是同样考虑。
 	{model.ErrEmailOccupied, CodeInvalidParam, "邮箱或密码不可用"},
 
+	// 登录失败。文案里绝不能透露到底是邮箱不存在还是密码错,
+	// service 层也已经把这两种情况合并成同一个错误了。
+	{model.ErrInvalidCredentials, CodeUnauthorized, "邮箱或密码不正确"},
+
 	// model.ErrSessionExists / ErrTaskExists 故意不登记:
 	// 它们意味着 ULID 撞了,属于内部故障,不该让客户端看见细节。
 }
