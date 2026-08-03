@@ -18,6 +18,7 @@ import (
 	"github.com/Jepson-Wang/mini_agent_backend/internal/config"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/handler"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/token"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/service"
 )
@@ -69,6 +70,11 @@ func main() {
 		fatal("迁移失败", err)
 	}
 
+	tokenMgr, err := token.NewManager(cfg.JWT.Secret, cfg.JWT.Issuer, cfg.JWT.AccessTTL)
+	if err != nil {
+		fatal("初始化令牌签发器失败", err)
+	}
+
 	repo := repository.New(db)
 	sessionSvc := service.NewSessionService(repo)
 	_ = sessionSvc // TODO: 注册到私有路由组
@@ -80,10 +86,8 @@ func main() {
 	}
 
 	router := handler.NewRouter(handler.Deps{
-		DB: db,
-		// TODO: Verifier 等令牌签发器做完再接。
-		// 现在是 nil,私有组会 fail closed(返回 50000),不会放行。
-		Verifier: nil,
+		DB:       db,
+		Verifier: tokenMgr,
 		Debug:    debug,
 	})
 
@@ -94,7 +98,13 @@ func main() {
 	}
 
 	go func() {
-		slog.Info("HTTP 服务启动", "addr", cfg.Server.Addr, "debug", debug)
+		// 只打有效期,不打密钥,也不打它的长度或指纹。
+		slog.Info("HTTP 服务启动",
+			"addr", cfg.Server.Addr,
+			"debug", debug,
+			"jwt_issuer", cfg.JWT.Issuer,
+			"jwt_access_ttl", cfg.JWT.AccessTTL.String(),
+		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fatal("HTTP 服务异常退出", err)
 		}
