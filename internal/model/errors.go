@@ -16,4 +16,12 @@ var (
 	// "用户不存在"和"密码错误"都必须归到这一个错误上,对外的 code 和文案
 	// 也必须完全一致,否则登录接口就成了账号探测器。
 	ErrInvalidCredentials = errors.New("invalid credentials")
+
+	// ErrUserDisabled 账号不可登录(封禁、注销等)。
+	//
+	// 它和 ErrInvalidCredentials 分开是安全的,前提是**先校验口令再看状态**:
+	// 能走到这一步说明对方已经拿着正确口令了,告诉他"账号被禁用"不多泄露什么,
+	// 反倒省掉一轮客服。顺序反过来就成了枚举接口 —— 不知道口令也能问出
+	// 某个邮箱是否注册过。见 service.AuthService.Login。
+	ErrUserDisabled = errors.New("user disabled")
 )
