@@ -20,6 +20,10 @@ type Deps struct {
 	// 传 nil 的话私有接口一律 500 而不是放行,见 middleware.Auth。
 	Verifier middleware.TokenVerifier
 
+	// Auth 处理注册和登录。传 nil 时这两个接口一律 500 —— 路由照常注册,
+	// 因为"接口不存在(404)"和"接口没接好(500)"是两回事,别混。
+	Auth AuthService
+
 	// Debug 打开后会注册 /debug/panic 这类只用于验证的路由。
 	// 生产环境必须是 false。
 	Debug bool
@@ -63,8 +67,15 @@ func NewRouter(d Deps) *gin.Engine {
 
 	api := r.Group("/api/v1")
 
-	// 登录注册这类不需要令牌的接口挂这儿
-	_ = api.Group("")
+	// 登录注册这类不需要令牌的接口挂这儿。
+	// 单独开一个组是为了将来往上加限流中间件 —— 撞库和批量注册
+	// 只会打这两个接口,限流不该挂到全站。
+	public := api.Group("")
+	{
+		auth := NewAuthHandler(d.Auth)
+		public.POST("/auth/register", auth.Register)
+		public.POST("/auth/login", auth.Login)
+	}
 
 	// ---- 私有路由:统一挂 Auth ----
 

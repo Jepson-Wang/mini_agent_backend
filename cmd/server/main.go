@@ -76,6 +76,7 @@ func main() {
 	}
 
 	repo := repository.New(db)
+	authSvc := service.NewAuthService(repo, tokenMgr)
 	sessionSvc := service.NewSessionService(repo)
 	_ = sessionSvc // TODO: 注册到私有路由组
 
@@ -87,6 +88,7 @@ func main() {
 
 	router := handler.NewRouter(handler.Deps{
 		DB:       db,
+		Auth:     authSvc,
 		Verifier: tokenMgr,
 		Debug:    debug,
 	})
