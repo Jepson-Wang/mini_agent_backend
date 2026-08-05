@@ -78,7 +78,6 @@ func main() {
 	repo := repository.New(db)
 	authSvc := service.NewAuthService(repo, tokenMgr)
 	sessionSvc := service.NewSessionService(repo)
-	_ = sessionSvc // TODO: 注册到私有路由组
 
 	// Agent 客户端还没实现,先传 nil:取消照样落库,只是通知发不出去,
 	// service 会记一条 Warn。见 service.TaskService.notifyCancel。
@@ -99,6 +98,7 @@ func main() {
 	router := handler.NewRouter(handler.Deps{
 		DB:            db,
 		Auth:          authSvc,
+		Session:       sessionSvc,
 		Task:          taskSvc,
 		TaskCallback:  taskSvc,
 		Verifier:      tokenMgr,

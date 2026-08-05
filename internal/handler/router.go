@@ -24,7 +24,10 @@ type Deps struct {
 	// 因为"接口不存在(404)"和"接口没接好(500)"是两回事,别混。
 	Auth AuthService
 
-	// Task 处理用户对任务的操作。传 nil 同上,500 不是 404。
+	// Session 处理会话及其下属任务。传 nil 同上,500 不是 404。
+	Session SessionService
+
+	// Task 处理用户对单个任务的操作(查详情、取消)。
 	Task TaskService
 
 	// TaskCallback 消费 Agent 报上来的任务状态,挂在 /internal 下面。
@@ -94,15 +97,24 @@ func NewRouter(d Deps) *gin.Engine {
 	private := api.Group("")
 	private.Use(middleware.Auth(d.Verifier))
 	{
+		// 会话,以及挂在会话下面的任务。
+		session := NewSessionHandler(d.Session)
+		private.POST("/sessions", session.Create)
+		private.GET("/sessions", session.List)
+		private.GET("/sessions/:id", session.Detail)
+		private.PATCH("/sessions/:id", session.UpdateTitle)
+		private.DELETE("/sessions/:id", session.Delete)
+		private.POST("/sessions/:id/tasks", session.CreateTask)
+		private.GET("/sessions/:id/tasks", session.ListTasks)
+
 		// 单个任务。task_uid 全局唯一,所以不挂在 /sessions 下面 ——
 		// 客户端拿到 uid 之后不必再记它属于哪个会话。
 		//
 		// 注意 gin 的限制:同一层级上的路径参数必须同名。
 		// /tasks/:uid 和 /tasks/:id 混用会在启动时直接 panic。
 		task := NewTaskHandler(d.Task)
+		private.GET("/tasks/:uid", task.Detail)
 		private.POST("/tasks/:uid/cancel", task.Cancel)
-
-		// TODO: session 的接口也注册到这儿。
 	}
 
 	// ---- 服务间路由:共享密钥,没有用户身份 ----

@@ -17,6 +17,7 @@ import (
 // 塞一个假的就能跑完整条 router 链路,不连数据库。
 // 生产实现是 *service.TaskService。
 type TaskService interface {
+	GetTaskDetailByTaskID(ctx context.Context, userID int64, taskUID string) (*model.Task, error)
 	Cancel(ctx context.Context, userID int64, taskUID string) (*model.Task, error)
 }
 
@@ -27,6 +28,31 @@ type TaskHandler struct {
 
 func NewTaskHandler(svc TaskService) *TaskHandler {
 	return &TaskHandler{svc: svc}
+}
+
+// Detail 处理 GET /api/v1/tasks/:uid。
+//
+// 客户端建完任务就靠轮询这个接口拿状态。路径不带 session_id ——
+// task_uid 全局唯一,归属校验看的是 tasks.user_id(从会话冗余下来的那一列,
+// 就是为了这一步不用 join)。
+func (h *TaskHandler) Detail(c *gin.Context) {
+	if h == nil || h.svc == nil {
+		notWired(c, "任务接口")
+		return
+	}
+
+	uid, ok := ulidParam(c, "uid", "任务")
+	if !ok {
+		return
+	}
+
+	t, err := h.svc.GetTaskDetailByTaskID(c.Request.Context(), middleware.MustUserID(c), uid)
+	if err != nil {
+		response.FailFromError(c, err)
+		return
+	}
+
+	response.OK(c, dto.NewTaskResp(t))
 }
 
 // Cancel 处理 POST /api/v1/tasks/:uid/cancel。
