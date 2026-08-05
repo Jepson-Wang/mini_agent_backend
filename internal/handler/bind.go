@@ -35,3 +35,28 @@ func bindJSON(c *gin.Context, req any) bool {
 	response.Fail(c, response.CodeInvalidParam, "请求体格式不正确")
 	return false
 }
+
+// bindQuery 解析并校验 URL 查询参数,规则同 bindJSON。
+//
+// 和 bindJSON 分开而不是加个参数,是因为兜底文案不一样:
+// 查询参数出错时说"请求体格式不正确"会让人对着 body 找半天。
+// 字段用 form tag,不是 json tag。
+func bindQuery(c *gin.Context, req any) bool {
+	err := c.ShouldBindQuery(req)
+	if err == nil {
+		return true
+	}
+
+	_ = c.Error(err)
+
+	if fields := validate.Translate(err); len(fields) > 0 {
+		response.FailWithData(c, response.CodeInvalidParam, "参数校验失败", gin.H{"fields": fields})
+		return false
+	}
+
+	// 类型转换失败,比如 ?limit=abc。原文形如
+	//   strconv.ParseInt: parsing "abc": invalid syntax
+	// 不算敏感,但也没必要给出去。
+	response.Fail(c, response.CodeInvalidParam, "查询参数格式不正确")
+	return false
+}
