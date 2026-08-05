@@ -80,6 +80,16 @@ func main() {
 	sessionSvc := service.NewSessionService(repo)
 	_ = sessionSvc // TODO: 注册到私有路由组
 
+	// Agent 客户端还没实现,先传 nil:取消照样落库,只是通知发不出去,
+	// service 会记一条 Warn。见 service.TaskService.notifyCancel。
+	taskSvc := service.NewTaskService(repo, nil)
+
+	// 没配 AGENT_CALLBACK_SECRET 的话 /internal 那组接口一律 500 而不是放行。
+	// 提前说一声,免得对面调不通时先去怀疑网络。
+	if cfg.Agent.CallbackSecret == "" {
+		slog.Warn("未配置 AGENT_CALLBACK_SECRET,/internal 下的接口将一律返回 500")
+	}
+
 	if debug {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -87,10 +97,13 @@ func main() {
 	}
 
 	router := handler.NewRouter(handler.Deps{
-		DB:       db,
-		Auth:     authSvc,
-		Verifier: tokenMgr,
-		Debug:    debug,
+		DB:            db,
+		Auth:          authSvc,
+		Task:          taskSvc,
+		TaskCallback:  taskSvc,
+		Verifier:      tokenMgr,
+		InternalToken: cfg.Agent.CallbackSecret,
+		Debug:         debug,
 	})
 
 	srv := &http.Server{

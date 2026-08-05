@@ -24,6 +24,18 @@ type Deps struct {
 	// 因为"接口不存在(404)"和"接口没接好(500)"是两回事,别混。
 	Auth AuthService
 
+	// Task 处理用户对任务的操作。传 nil 同上,500 不是 404。
+	Task TaskService
+
+	// TaskCallback 消费 Agent 报上来的任务状态,挂在 /internal 下面。
+	TaskCallback TaskCallbackService
+
+	// InternalToken 是 /internal 路由组的共享密钥,来自 AGENT_CALLBACK_SECRET。
+	//
+	// 传空则那组接口一律 500 而不是放行 —— 它能直接改任务状态,
+	// 漏配时放行等于把它开给全世界。见 middleware.InternalAuth。
+	InternalToken string
+
 	// Debug 打开后会注册 /debug/panic 这类只用于验证的路由。
 	// 生产环境必须是 false。
 	Debug bool
@@ -81,9 +93,32 @@ func NewRouter(d Deps) *gin.Engine {
 
 	private := api.Group("")
 	private.Use(middleware.Auth(d.Verifier))
-	// TODO: session / task 的接口注册到 private 上,
-	// handler 里用 middleware.MustUserID(c) 取当前用户。
-	_ = private
+	{
+		// 单个任务。task_uid 全局唯一,所以不挂在 /sessions 下面 ——
+		// 客户端拿到 uid 之后不必再记它属于哪个会话。
+		//
+		// 注意 gin 的限制:同一层级上的路径参数必须同名。
+		// /tasks/:uid 和 /tasks/:id 混用会在启动时直接 panic。
+		task := NewTaskHandler(d.Task)
+		private.POST("/tasks/:uid/cancel", task.Cancel)
+
+		// TODO: session 的接口也注册到这儿。
+	}
+
+	// ---- 服务间路由:共享密钥,没有用户身份 ----
+	//
+	// 挂在引擎根上而不是 /api/v1 下面,是为了让"这条路径不是给用户的"
+	// 从 URL 上就能看出来 —— 网关按前缀就能把 /internal 挡在公网之外,
+	// 不用去认某一条具体的路由。
+	//
+	// 这个组下面绝不能出现拿入参当身份的接口(比如"列出用户 X 的任务"):
+	// 共享密钥只能证明调用方是我们自己的服务,证明不了它代表谁。
+	internalGroup := r.Group("/internal")
+	internalGroup.Use(middleware.InternalAuth(d.InternalToken))
+	{
+		ih := NewInternalHandler(d.TaskCallback)
+		internalGroup.POST("/tasks/:uid/callback", ih.TaskCallback)
+	}
 
 	// ---- 仅调试 ----
 
