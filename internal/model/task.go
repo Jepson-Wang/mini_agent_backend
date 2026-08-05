@@ -18,3 +18,29 @@ type Task struct {
 }
 
 func (Task) TableName() string { return "tasks" }
+
+// 任务状态。落库是 varchar(16),别往里加更长的值。
+//
+// pending / running 是中间态,succeeded / failed / canceled 是终态。
+// 「终态不再变」是整个状态机唯一的硬规则 —— repository 那几个 Mark* 方法
+// 用一条带 status IN (...) 的 UPDATE 来兑现它,迟到的回调自然就落空了。
+const (
+	TaskPending   = "pending"
+	TaskRunning   = "running"
+	TaskSucceeded = "succeeded"
+	TaskFailed    = "failed"
+	TaskCanceled  = "canceled"
+)
+
+// IsTerminal 报告 status 是不是终态。
+//
+// 未知状态按「非终态」处理:真出现了库里存着没登记的值这种事,
+// 让它还能被推动、被取消,好过卡死在那儿谁也动不了。
+func IsTerminal(status string) bool {
+	switch status {
+	case TaskSucceeded, TaskFailed, TaskCanceled:
+		return true
+	default:
+		return false
+	}
+}
