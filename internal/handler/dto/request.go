@@ -9,6 +9,12 @@
 // 失败信息由 internal/pkg/validate 翻译成人话,不会把 validator 的原文吐出去。
 package dto
 
+import (
+	"strings"
+
+	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
+)
+
 // RegisterReq 注册请求。
 type RegisterReq struct {
 	// max=255 对齐 users.email 的 varchar(255)。
@@ -39,4 +45,35 @@ type RegisterReq struct {
 type LoginReq struct {
 	Email    string `json:"email" binding:"required,email,max=255"`
 	Password string `json:"password" binding:"required,bmax=72"`
+}
+
+// TaskCallbackReq 是 Agent 回报任务状态的请求体。
+//
+// 只放行 running / succeeded / failed 三个值。canceled 不在里面是刻意的:
+// 取消只能由用户发起,让 Agent 也能把任务改成"已取消",等于给一个
+// 被攻破的 Agent 一个悄悄吞任务的开关 —— 用户看到的是自己取消的,不会去查。
+type TaskCallbackReq struct {
+	Status string `json:"status" binding:"required,oneof=running succeeded failed"`
+
+	// ErrorMsg 失败原因,只在 status=failed 时有意义。
+	//
+	// 必须限长:这个值会原样落进 tasks.error_msg,而那是一列 text,
+	// 数据库自己不设上限。不挡的话对面一次能往库里塞几 MB,
+	// 而且它还会跟着任务详情接口发回给用户。
+	ErrorMsg *string `json:"error_msg" binding:"omitempty,max=2000"`
+}
+
+// NormalizedErrorMsg 返回该写进库的失败原因。
+//
+// 只有 failed 才带原因 —— 成功的任务不该留着上一次的错误信息。
+// 空白串归一成 nil,免得库里同时存在 NULL 和 "" 两种"没有原因",
+// 查询时得写两个条件。
+func (r TaskCallbackReq) NormalizedErrorMsg() *string {
+	if r.Status != model.TaskFailed || r.ErrorMsg == nil {
+		return nil
+	}
+	if msg := strings.TrimSpace(*r.ErrorMsg); msg != "" {
+		return &msg
+	}
+	return nil
 }

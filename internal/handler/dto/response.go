@@ -58,6 +58,57 @@ type AuthResp struct {
 	User *UserResp `json:"user"`
 }
 
+// TaskResp 是对外的任务视图。
+//
+// 和 UserResp 一样手写字段、不内嵌 model.Task,理由也一样。
+// 两个字段是刻意漏掉的:
+//   - ID:自增主键。给出去等于把全站任务总量和增速一起送人
+//     (下两次单,一减就知道这中间平台接了多少活)。
+//   - UserID:能看到这条记录就说明它是你的,再回一遍没有信息量。
+type TaskResp struct {
+	TaskUID   string `json:"task_uid"`
+	SessionID string `json:"session_id"`
+	Status    string `json:"status"`
+
+	Input *string `json:"input"`
+
+	// ErrorMsg 是 Agent 报上来的失败原因,会原样展示给用户。
+	// 写这个值的地方(dto.TaskCallbackReq)必须限长,否则这里会跟着一起爆。
+	ErrorMsg *string `json:"error_msg"`
+
+	StartedAt  *time.Time `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+// NewTaskResp 从 model 转成对外视图。t 为 nil 时返回 nil。
+func NewTaskResp(t *model.Task) *TaskResp {
+	if t == nil {
+		return nil
+	}
+	return &TaskResp{
+		TaskUID:    t.TaskUID,
+		SessionID:  t.SessionID,
+		Status:     t.Status,
+		Input:      t.Input,
+		ErrorMsg:   t.ErrorMsg,
+		StartedAt:  t.StartedAt,
+		FinishedAt: t.FinishedAt,
+		CreatedAt:  t.CreatedAt,
+		UpdatedAt:  t.UpdatedAt,
+	}
+}
+
+// TaskCallbackResp 告诉回调方这次到底改没改到状态。
+//
+// applied=false 时接口仍然返回 200(见 handler.InternalHandler.TaskCallback),
+// 所以必须有这么个字段 —— 否则"任务已经被取消了"和"状态成功推进"
+// 在回调方眼里长得一模一样,出问题时查不出来。
+type TaskCallbackResp struct {
+	Applied bool `json:"applied"`
+}
+
 // NewAuthResp 组装登录态响应。expiresAt 由签发方给出,剩余秒数在这里算。
 func NewAuthResp(u *model.User, token string, expiresAt time.Time) *AuthResp {
 	return &AuthResp{
