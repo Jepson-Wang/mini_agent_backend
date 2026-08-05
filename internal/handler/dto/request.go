@@ -47,6 +47,66 @@ type LoginReq struct {
 	Password string `json:"password" binding:"required,bmax=72"`
 }
 
+// CreateSessionReq 创建会话。会话和它的首个任务是一起建的(一个事务)。
+//
+// 两个字段都可空:允许先开一个空会话,标题等首轮对话出来再回填。
+type CreateSessionReq struct {
+	// max=128 对齐 sessions.title 的 varchar(128)。
+	// Postgres 的 varchar(n) 也按字符算,和 validator 的 max 正好对得上。
+	Title *string `json:"title" binding:"omitempty,max=128"`
+
+	// tasks.input 是 text,数据库自己不设上限,所以必须在入口挡。
+	// 不挡的话一次请求就能往库里塞几 MB,而且它还会跟着任务详情原样发回去。
+	Input *string `json:"input" binding:"omitempty,max=8000"`
+}
+
+// UpdateSessionTitleReq 改标题。
+//
+// Title 是 *string 且 required,意思是"这个字段必须出现在 body 里"。
+// 少了它的话 {} 和 {"title": null} 在 Go 这边都是 nil,分不出
+// "没提这个字段"和"要求清空" —— 而这两件事的语义完全相反。
+//
+// 清空标题的写法是 {"title": ""},空白串会被 NormalizedTitle 归成 nil。
+// 不接受 null 是刻意的:让"清空"有一个明确的、可校验的写法。
+type UpdateSessionTitleReq struct {
+	Title *string `json:"title" binding:"required,max=128"`
+}
+
+// NormalizedTitle 返回该写进库的标题。空白串归成 nil,对应库里的 NULL。
+// 和 normalizeNickname 是同一个理由:不这么做的话库里会同时存在
+// NULL 和 "" 两种"没有标题",查询时得写两个条件。
+func (r UpdateSessionTitleReq) NormalizedTitle() *string {
+	if r.Title == nil {
+		return nil
+	}
+	if s := strings.TrimSpace(*r.Title); s != "" {
+		return &s
+	}
+	return nil
+}
+
+// CreateTaskReq 在已有会话下追加一个任务。
+//
+// 这里的 input 是 required,和 CreateSessionReq 不一样:
+// 建空会话说得通(等用户想好再说),建一个没有输入的任务说不通。
+type CreateTaskReq struct {
+	Input *string `json:"input" binding:"required,max=8000"`
+}
+
+// PageQuery 是列表接口的分页参数,用 form tag 从 query string 里取。
+//
+// limit 的上限写死 100,和 repository 的 maxListLimit 对齐。两边都夹是刻意的:
+// 这里回 40000 让调用方知道自己传错了,仓库层那道则保证"哪怕有人绕过 handler
+// 直接调 service 也读不出全表"。
+//
+// limit=0 走 omitempty(int 的零值)不校验,落到 service 变成默认页大小;
+// limit=-1 不是零值,会被 min=1 拦下 —— 这个值很关键,
+// GORM 的 Limit(负数) 是"整个不写 LIMIT 子句",也就是全表。
+type PageQuery struct {
+	Limit  int `form:"limit" binding:"omitempty,min=1,max=100"`
+	Offset int `form:"offset" binding:"omitempty,min=0"`
+}
+
 // TaskCallbackReq 是 Agent 回报任务状态的请求体。
 //
 // 只放行 running / succeeded / failed 三个值。canceled 不在里面是刻意的:
