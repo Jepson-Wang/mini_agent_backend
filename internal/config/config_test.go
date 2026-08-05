@@ -25,7 +25,8 @@ func writeYAML(t *testing.T, content string) string {
 func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
-		"CONFIG_PATH", "ENV_PATH", "APP_ENV", "HTTP_ADDR", "DB_DSN", "AGENT_ADDR",
+		"CONFIG_PATH", "ENV_PATH", "APP_ENV", "HTTP_ADDR", "DB_DSN",
+		"AGENT_ADDR", "AGENT_CALLBACK_SECRET",
 		"JWT_ISSUER", "JWT_SECRET", "JWT_ACCESS_TTL",
 	} {
 		// 两步走。t.Setenv 是为了登记 cleanup,测试结束把原值还回去;
@@ -177,6 +178,53 @@ func TestLoad_ShortSecret(t *testing.T) {
 	}
 	// 这条错误会进启动日志,绝不能把密钥本身带出去。
 	if strings.Contains(err.Error(), short) {
+		t.Errorf("错误信息里出现了密钥内容: %v", err)
+	}
+}
+
+// 回调密钥不是必填 —— 缺了只是 /internal 那组接口用不了(一律 500),
+// 不该把整个服务拦在门外。
+func TestLoad_CallbackSecretOptional(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("缺 AGENT_CALLBACK_SECRET 不该阻止启动: %v", err)
+	}
+	if cfg.Agent.CallbackSecret != "" {
+		t.Errorf("Agent.CallbackSecret = %q, 期望空", cfg.Agent.CallbackSecret)
+	}
+}
+
+// 但填了就得够长。"填了个 8 位的"比"没填"更危险 —— 前者会让人以为已经防住了。
+func TestLoad_ShortCallbackSecret(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	short := "tooshort"
+	t.Setenv("AGENT_CALLBACK_SECRET", short)
+
+	_, err := Load(writeYAML(t, minimalYAML))
+	if err == nil {
+		t.Fatal("过短的回调密钥应当报错")
+	}
+	// 这条会进启动日志。
+	if strings.Contains(err.Error(), short) {
+		t.Errorf("错误信息里出现了密钥内容: %v", err)
+	}
+}
+
+// 两个密钥必须是两个值:一个泄露了不该顺带把另一个也交出去。
+func TestLoad_CallbackSecretMustDifferFromJWT(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("AGENT_CALLBACK_SECRET", testSecret)
+
+	_, err := Load(writeYAML(t, minimalYAML))
+	if err == nil {
+		t.Fatal("两个密钥相同应当报错")
+	}
+	if strings.Contains(err.Error(), testSecret) {
 		t.Errorf("错误信息里出现了密钥内容: %v", err)
 	}
 }

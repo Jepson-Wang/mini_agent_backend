@@ -45,6 +45,17 @@ type Database struct {
 
 type Agent struct {
 	Addr string `yaml:"addr"`
+
+	// CallbackSecret 是 Agent 回调本服务时用的共享密钥,
+	// 只从 AGENT_CALLBACK_SECRET 读。yaml:"-" 的理由和 JWT.Secret 一样。
+	//
+	// 必须和 JWT_SECRET 取不同的值:一个泄露了,不该顺带把另一个也交出去。
+	//
+	// 和 JWT.Secret 不同,它**不是启动必填**。缺了的话 /internal 那组接口
+	// 一律 500(见 middleware.InternalAuth),服务其余部分照常工作 ——
+	// 这是"接口用不了",不是"接口没防护",所以不用把整个进程拦在门外。
+	// 但只要填了,就得够长。
+	CallbackSecret string `yaml:"-"`
 }
 
 type JWT struct {
@@ -142,6 +153,7 @@ func (c *Config) applyEnv() error {
 	setString(&c.Server.Addr, "HTTP_ADDR")
 	setString(&c.Database.DSN, "DB_DSN")
 	setString(&c.Agent.Addr, "AGENT_ADDR")
+	setString(&c.Agent.CallbackSecret, "AGENT_CALLBACK_SECRET")
 	setString(&c.JWT.Issuer, "JWT_ISSUER")
 	setString(&c.JWT.Secret, "JWT_SECRET")
 
@@ -184,6 +196,14 @@ func (c *Config) Validate() error {
 	if len(c.JWT.Secret) < minSecretLen {
 		// 不把密钥本身写进错误里 —— 这条会进启动日志。
 		return fmt.Errorf("JWT_SECRET 至少 %d 字节,当前 %d 字节", minSecretLen, len(c.JWT.Secret))
+	}
+	// 空表示不启用 /internal(那组接口会一律 500),但填了就必须够长。
+	// "填了个 8 位的" 比 "没填" 危险得多:前者会让人以为已经防住了。
+	if s := c.Agent.CallbackSecret; s != "" && len(s) < minSecretLen {
+		return fmt.Errorf("AGENT_CALLBACK_SECRET 至少 %d 字节,当前 %d 字节", minSecretLen, len(s))
+	}
+	if c.Agent.CallbackSecret != "" && c.Agent.CallbackSecret == c.JWT.Secret {
+		return fmt.Errorf("AGENT_CALLBACK_SECRET 不能和 JWT_SECRET 相同")
 	}
 	return nil
 }
