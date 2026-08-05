@@ -95,6 +95,15 @@ var errRules = []errRule{
 	// 所以这里说清楚不算泄露,还能少一轮客服往返。
 	{model.ErrUserDisabled, CodeForbidden, "账号已被禁用,请联系管理员"},
 
+	// 任务已经是终态,取消不了。能看到这条说明归属校验已经过了
+	// (service.TaskService.mustOwn 先跑),所以说清楚不算泄露。
+	// 用 40900 而不是 40000:请求本身没毛病,是资源的状态不允许。
+	{model.ErrTaskNotCancelable, CodeConflict, "任务已经结束,无法取消"},
+
+	// 回调带来的状态不认识。这条基本只会在内部回调接口上出现,
+	// binding 的 oneof 已经挡过一层了。
+	{model.ErrTaskStatusInvalid, CodeInvalidParam, "任务状态不合法"},
+
 	// model.ErrSessionExists / ErrTaskExists 故意不登记:
 	// 它们意味着 ULID 撞了,属于内部故障,不该让客户端看见细节。
 }
