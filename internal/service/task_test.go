@@ -1,3 +1,5 @@
+// task_test.go 只放 TaskService 的用例。
+// withTaskSvc / fakeAgent / seedTask 在 helpers_test.go。
 package service
 
 import (
@@ -5,66 +7,16 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/Jepson-Wang/mini_agent_backend/internal/agent"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
-	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ptr"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
 )
-
-// fakeAgent 记下被要求取消了哪些任务,可以指定让 CancelTask 报错。
-type fakeAgent struct {
-	canceled []string
-	err      error
-}
-
-func (f *fakeAgent) StartTask(context.Context, agent.StartTaskReq) error { return nil }
-
-func (f *fakeAgent) CancelTask(_ context.Context, taskUID string) error {
-	f.canceled = append(f.canceled, taskUID)
-	return f.err
-}
-
-// withTaskSvc 把用例跑在独立事务里,结束一律回滚。
-// 和 withSvc 一个套路 —— 绕开它直接用包级 testDB 会在 t.Parallel() 下偶发失败。
-func withTaskSvc(t *testing.T, fn func(t *testing.T, s *TaskService, r *repository.Repository, ag *fakeAgent)) {
-	t.Helper()
-	if testDB == nil {
-		t.Skip("未设置 TEST_DSN,跳过需要数据库的用例")
-	}
-	tx := testDB.Begin()
-	if tx.Error != nil {
-		t.Fatalf("开启事务失败: %v", tx.Error)
-	}
-	t.Cleanup(func() { tx.Rollback() })
-
-	repo := repository.New(tx)
-	ag := &fakeAgent{}
-	fn(t, NewTaskService(repo, ag), repo, ag)
-}
-
-// seedTask 建一个用户、一个会话和一个 pending 任务,返回用户 id 和 task_uid。
-func seedTask(t *testing.T, r *repository.Repository, email string) (int64, string) {
-	t.Helper()
-	ctx := context.Background()
-
-	u, err := r.User.Create(ctx, email, "$2a$04$fakefakefakefakefakefakefakefakefakefakefa", nil)
-	if err != nil {
-		t.Fatalf("建用户: %v", err)
-	}
-	sess := NewSessionService(r)
-	_, task, err := sess.CreateWithFirstTask(ctx, u.ID, ptr.To("测试会话"), ptr.To("跑一下"))
-	if err != nil {
-		t.Fatalf("建会话和任务: %v", err)
-	}
-	return u.ID, task.TaskUID
-}
 
 // ---- Cancel ----
 
 func TestCancel_MarksCanceled(t *testing.T) {
 	withTaskSvc(t, func(t *testing.T, s *TaskService, r *repository.Repository, ag *fakeAgent) {
 		ctx := context.Background()
-		userID, uid := seedTask(t, r, "cancel-ok@example.com")
+		userID, uid := seedTask(t, r)
 
 		got, err := s.Cancel(ctx, userID, uid)
 		if err != nil {
@@ -89,7 +41,7 @@ func TestCancel_MarksCanceled(t *testing.T) {
 func TestCancel_LateCallbackCannotRevive(t *testing.T) {
 	withTaskSvc(t, func(t *testing.T, s *TaskService, r *repository.Repository, _ *fakeAgent) {
 		ctx := context.Background()
-		userID, uid := seedTask(t, r, "cancel-race@example.com")
+		userID, uid := seedTask(t, r)
 
 		if _, err := s.Cancel(ctx, userID, uid); err != nil {
 			t.Fatalf("Cancel: %v", err)
@@ -118,8 +70,8 @@ func TestCancel_LateCallbackCannotRevive(t *testing.T) {
 func TestCancel_OtherUsersTaskLooksMissing(t *testing.T) {
 	withTaskSvc(t, func(t *testing.T, s *TaskService, r *repository.Repository, ag *fakeAgent) {
 		ctx := context.Background()
-		_, uid := seedTask(t, r, "owner@example.com")
-		intruderID, _ := seedTask(t, r, "intruder@example.com")
+		_, uid := seedTask(t, r)
+		intruderID, _ := seedTask(t, r)
 
 		_, errMine := s.Cancel(ctx, intruderID, uid)
 		_, errGone := s.Cancel(ctx, intruderID, "01J8ZQXK7PZZZZZZZZZZZZZZZZ")
@@ -148,7 +100,7 @@ func TestCancel_OtherUsersTaskLooksMissing(t *testing.T) {
 func TestCancel_AlreadyTerminal(t *testing.T) {
 	withTaskSvc(t, func(t *testing.T, s *TaskService, r *repository.Repository, _ *fakeAgent) {
 		ctx := context.Background()
-		userID, uid := seedTask(t, r, "cancel-done@example.com")
+		userID, uid := seedTask(t, r)
 
 		if _, err := r.Task.MarkSucceeded(ctx, uid); err != nil {
 			t.Fatalf("MarkSucceeded: %v", err)
@@ -167,7 +119,7 @@ func TestCancel_AgentFailureDoesNotFailTheRequest(t *testing.T) {
 	withTaskSvc(t, func(t *testing.T, s *TaskService, r *repository.Repository, ag *fakeAgent) {
 		ctx := context.Background()
 		ag.err = errors.New("connection refused")
-		userID, uid := seedTask(t, r, "cancel-agent-down@example.com")
+		userID, uid := seedTask(t, r)
 
 		got, err := s.Cancel(ctx, userID, uid)
 		if err != nil {
@@ -180,16 +132,11 @@ func TestCancel_AgentFailureDoesNotFailTheRequest(t *testing.T) {
 }
 
 // Agent 客户端还没接上(nil)时同样不该失败。
+// 这条不能用 withTaskSvc —— 它塞的是假 Agent,正好把要验的东西盖掉了。
 func TestCancel_NilAgent(t *testing.T) {
-	if testDB == nil {
-		t.Skip("未设置 TEST_DSN,跳过需要数据库的用例")
-	}
-	tx := testDB.Begin()
-	t.Cleanup(func() { tx.Rollback() })
-
-	r := repository.New(tx)
+	r := withTx(t)
 	s := NewTaskService(r, nil)
-	userID, uid := seedTask(t, r, "cancel-no-agent@example.com")
+	userID, uid := seedTask(t, r)
 
 	if _, err := s.Cancel(context.Background(), userID, uid); err != nil {
 		t.Fatalf("未注入 Agent 不该让取消失败: %v", err)
@@ -201,7 +148,7 @@ func TestCancel_NilAgent(t *testing.T) {
 func TestHandleCallback_Transitions(t *testing.T) {
 	withTaskSvc(t, func(t *testing.T, s *TaskService, r *repository.Repository, _ *fakeAgent) {
 		ctx := context.Background()
-		_, uid := seedTask(t, r, "callback-flow@example.com")
+		_, uid := seedTask(t, r)
 
 		applied, err := s.HandleCallback(ctx, uid, model.TaskRunning, nil)
 		if err != nil || !applied {
@@ -235,7 +182,7 @@ func TestHandleCallback_Transitions(t *testing.T) {
 func TestHandleCallback_RejectsCanceled(t *testing.T) {
 	withTaskSvc(t, func(t *testing.T, s *TaskService, r *repository.Repository, _ *fakeAgent) {
 		ctx := context.Background()
-		_, uid := seedTask(t, r, "callback-cancel@example.com")
+		_, uid := seedTask(t, r)
 
 		applied, err := s.HandleCallback(ctx, uid, model.TaskCanceled, nil)
 		if !errors.Is(err, model.ErrTaskStatusInvalid) {
@@ -275,7 +222,7 @@ func TestHandleCallback_UnknownTaskIsNotAnError(t *testing.T) {
 func TestHandleCallback_TerminalIsFinal(t *testing.T) {
 	withTaskSvc(t, func(t *testing.T, s *TaskService, r *repository.Repository, _ *fakeAgent) {
 		ctx := context.Background()
-		_, uid := seedTask(t, r, "callback-final@example.com")
+		_, uid := seedTask(t, r)
 
 		if applied, err := s.HandleCallback(ctx, uid, model.TaskSucceeded, nil); err != nil || !applied {
 			t.Fatalf("pending → succeeded 应当成功: applied=%v err=%v", applied, err)

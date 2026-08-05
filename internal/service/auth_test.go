@@ -1,96 +1,22 @@
+// auth_test.go 只放 AuthService 的用例。
+// 事务夹具、fakeIssuer、uniqueEmail 这些在 helpers_test.go,
+// 测试库连接和 TestMain 在 main_test.go。
 package service
 
 import (
 	"context"
 	"errors"
-	"fmt"
-	"log"
-	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/hash"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
 )
-
-// testDB 是本包共用的连接,没配 TEST_DSN 时为 nil,用例会被跳过。
-// 跑法和 internal/repository 的用例一样(PowerShell):
-//
-//	$env:TEST_DSN="host=localhost user=postgres password=... dbname=mini_agent_test port=5432 sslmode=disable"
-//	go test ./internal/service/
-var testDB *gorm.DB
-
-func TestMain(m *testing.M) {
-	// bcrypt 的 cost 12 每次要 160ms,这个包里要散列几十次。
-	// 调到最低只影响耗时,不影响任何被测行为。
-	if err := hash.SetCost(bcrypt.MinCost); err != nil {
-		log.Fatalf("SetCost: %v", err)
-	}
-
-	if dsn := os.Getenv("TEST_DSN"); dsn != "" {
-		db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
-			Logger: logger.Default.LogMode(logger.Silent),
-			// ErrEmailOccupied 的断言全靠它。
-			TranslateError: true,
-		})
-		if err != nil {
-			log.Fatalf("连接测试库失败: %v", err)
-		}
-		if err := db.AutoMigrate(&model.User{}, &model.Session{}, &model.Task{}); err != nil {
-			log.Fatalf("测试库迁移失败: %v", err)
-		}
-		testDB = db
-	}
-	os.Exit(m.Run())
-}
-
-// fakeIssuer 记下拿到的 userID,顺便省掉真造一个 32 字节密钥。
-type fakeIssuer struct {
-	lastUID int64
-	err     error
-}
-
-func (f *fakeIssuer) Issue(userID int64) (string, time.Time, error) {
-	f.lastUID = userID
-	if f.err != nil {
-		return "", time.Time{}, f.err
-	}
-	return "tok-" + strconv.FormatInt(userID, 10), time.Now().Add(time.Hour), nil
-}
-
-// withSvc 把用例跑在独立事务里,结束一律回滚,用例之间互不干扰。
-func withSvc(t *testing.T, fn func(t *testing.T, s *AuthService, r *repository.Repository, iss *fakeIssuer)) {
-	t.Helper()
-	if testDB == nil {
-		t.Skip("未设置 TEST_DSN,跳过需要数据库的用例")
-	}
-	tx := testDB.Begin()
-	if tx.Error != nil {
-		t.Fatalf("开启事务失败: %v", tx.Error)
-	}
-	t.Cleanup(func() { tx.Rollback() })
-
-	repo := repository.New(tx)
-	iss := &fakeIssuer{}
-	fn(t, NewAuthService(repo, iss), repo, iss)
-}
-
-var emailSeq atomic.Int64
-
-func uniqueEmail() string {
-	return fmt.Sprintf("svc%d@test.local", emailSeq.Add(1))
-}
-
-const testPassword = "correct horse battery"
 
 func TestRegister_OK(t *testing.T) {
 	withSvc(t, func(t *testing.T, s *AuthService, r *repository.Repository, iss *fakeIssuer) {
