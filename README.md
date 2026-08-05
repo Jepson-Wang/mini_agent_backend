@@ -21,6 +21,16 @@ configs           配置文件
 
 ## 开发
 
+先准备环境变量。`JWT_SECRET` 没有默认值也不能写进 `configs/config.yaml`,不给就起不来:
+
+```
+cp .env.example .env
+openssl rand -base64 48     # 把结果填进 .env 的 JWT_SECRET
+```
+
+`.env` 只在服务启动时加载,且不覆盖已存在的环境变量。
+优先级:内置默认值 < `configs/config.yaml` < `.env` < 真实环境变量。
+
 ```
 make run      启动服务
 make test     跑测试

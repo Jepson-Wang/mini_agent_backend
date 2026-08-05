@@ -47,10 +47,19 @@ func OK(c *gin.Context, data any) {
 // 注意 Fail 会 Abort:响应已经写出去了,后面的 handler 不该再跑,
 // 否则会重复写 body。中间件里调完直接 return 即可。
 func Fail(c *gin.Context, code int, message string) {
+	FailWithData(c, code, message, nil)
+}
+
+// FailWithData 同 Fail,但额外带一份结构化数据。
+//
+// 目前只有参数校验用它,带的是 字段名 → 提示语 的映射,让前端能直接
+// 高亮到出错的输入框。data 里只能放已经翻译好的、给人看的内容,
+// 别把原始 err 塞进来 —— 那是 Fail 存在的原因。
+func FailWithData(c *gin.Context, code int, message string, data any) {
 	if message == "" {
 		message = Text(code)
 	}
-	write(c, code, message, nil)
+	write(c, code, message, data)
 	c.Abort()
 }
 
@@ -77,6 +86,23 @@ var errRules = []errRule{
 	// 注册时邮箱被占用。这里刻意不说"该邮箱已注册",
 	// 否则接口就成了账号探测器。model.ErrEmailOccupied 的文案也是同样考虑。
 	{model.ErrEmailOccupied, CodeInvalidParam, "邮箱或密码不可用"},
+
+	// 登录失败。文案里绝不能透露到底是邮箱不存在还是密码错,
+	// service 层也已经把这两种情况合并成同一个错误了。
+	{model.ErrInvalidCredentials, CodeUnauthorized, "邮箱或密码不正确"},
+
+	// 账号被禁用。能看到这条说明口令已经对了(Login 是先验口令再看状态),
+	// 所以这里说清楚不算泄露,还能少一轮客服往返。
+	{model.ErrUserDisabled, CodeForbidden, "账号已被禁用,请联系管理员"},
+
+	// 任务已经是终态,取消不了。能看到这条说明归属校验已经过了
+	// (service.TaskService.mustOwn 先跑),所以说清楚不算泄露。
+	// 用 40900 而不是 40000:请求本身没毛病,是资源的状态不允许。
+	{model.ErrTaskNotCancelable, CodeConflict, "任务已经结束,无法取消"},
+
+	// 回调带来的状态不认识。这条基本只会在内部回调接口上出现,
+	// binding 的 oneof 已经挡过一层了。
+	{model.ErrTaskStatusInvalid, CodeInvalidParam, "任务状态不合法"},
 
 	// model.ErrSessionExists / ErrTaskExists 故意不登记:
 	// 它们意味着 ULID 撞了,属于内部故障,不该让客户端看见细节。

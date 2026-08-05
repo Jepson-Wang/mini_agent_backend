@@ -74,7 +74,7 @@ func uniqueEmail() string {
 
 func mustUser(t *testing.T, r *Repository) *model.User {
 	t.Helper()
-	u, err := r.User.Create(context.Background(), uniqueEmail(), "hash")
+	u, err := r.User.Create(context.Background(), uniqueEmail(), "hash", nil)
 	if err != nil {
 		t.Fatalf("准备用户数据失败: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestUserRepo_CreateAndGetByEmail(t *testing.T) {
 		ctx := context.Background()
 		email := uniqueEmail()
 
-		created, err := r.User.Create(ctx, email, "hash")
+		created, err := r.User.Create(ctx, email, "hash", nil)
 		if err != nil {
 			t.Fatalf("创建用户: %v", err)
 		}
@@ -142,14 +142,14 @@ func TestUserRepo_Create_DuplicateEmail(t *testing.T) {
 		ctx := context.Background()
 		email := uniqueEmail()
 
-		if _, err := r.User.Create(ctx, email, "hash"); err != nil {
+		if _, err := r.User.Create(ctx, email, "hash", nil); err != nil {
 			t.Fatalf("首次创建: %v", err)
 		}
 
 		// 注意:唯一约束冲突会让整个事务进入 aborted 状态,
 		// 之后任何语句都会报 "current transaction is aborted"。
 		// 所以这种预期失败的调用必须放在用例最后。
-		_, err := r.User.Create(ctx, email, "hash")
+		_, err := r.User.Create(ctx, email, "hash", nil)
 		if !errors.Is(err, model.ErrEmailOccupied) {
 			t.Fatalf("期望 ErrEmailOccupied,实际是 %v", err)
 		}
@@ -448,7 +448,7 @@ func TestRepository_Transaction_RollsBackOnError(t *testing.T) {
 		sentinel := errors.New("故意失败")
 
 		err := r.Transaction(ctx, func(tr *Repository) error {
-			if _, err := tr.User.Create(ctx, email, "hash"); err != nil {
+			if _, err := tr.User.Create(ctx, email, "hash", nil); err != nil {
 				return err
 			}
 			return sentinel
@@ -470,7 +470,7 @@ func TestRepository_Transaction_CommitsOnSuccess(t *testing.T) {
 		email := uniqueEmail()
 
 		err := r.Transaction(ctx, func(tr *Repository) error {
-			_, err := tr.User.Create(ctx, email, "hash")
+			_, err := tr.User.Create(ctx, email, "hash", nil)
 			return err
 		})
 		if err != nil {

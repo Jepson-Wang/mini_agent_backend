@@ -13,6 +13,7 @@ const (
 	CodeForbidden        = 40300 // 无权限
 	CodeNotFound         = 40400 // 资源不存在
 	CodeMethodNotAllowed = 40500 // 请求方法不被支持(NoMethod 兜底用,见 handler.NewRouter)
+	CodeConflict         = 40900 // 和资源当前状态冲突(比如去取消一个已经跑完的任务)
 	CodeQuotaExceeded    = 42900 // 超出配额
 	CodeInternal         = 50000 // 内部错误
 )
@@ -26,6 +27,7 @@ var codeText = map[int]string{
 	CodeForbidden:        "无权限",
 	CodeNotFound:         "资源不存在",
 	CodeMethodNotAllowed: "请求方法不被支持",
+	CodeConflict:         "当前状态下无法执行该操作",
 	CodeQuotaExceeded:    "超出配额",
 	CodeInternal:         "内部错误",
 }

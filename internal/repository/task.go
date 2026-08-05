@@ -57,16 +57,16 @@ func (r *TaskRepo) ListBySession(ctx context.Context, sessionID string, limit, o
 
 // MarkRunning 把任务从 pending 推到 running。
 func (r *TaskRepo) MarkRunning(ctx context.Context, taskUID string) (bool, error) {
-	return r.cas(ctx, taskUID, []string{"pending"}, map[string]any{
-		"status":     "running",
+	return r.cas(ctx, taskUID, []string{model.TaskPending}, map[string]any{
+		"status":     model.TaskRunning,
 		"started_at": time.Now(),
 	})
 }
 
 // MarkSucceeded 把任务标记为成功。
 func (r *TaskRepo) MarkSucceeded(ctx context.Context, taskUID string) (bool, error) {
-	return r.cas(ctx, taskUID, []string{"pending", "running"}, map[string]any{
-		"status":      "succeeded",
+	return r.cas(ctx, taskUID, []string{model.TaskPending, model.TaskRunning}, map[string]any{
+		"status":      model.TaskSucceeded,
 		"finished_at": time.Now(),
 	})
 }
@@ -74,9 +74,22 @@ func (r *TaskRepo) MarkSucceeded(ctx context.Context, taskUID string) (bool, err
 // MarkFailed 把任务标记为失败。errMsg 传 nil 表示不记原因,
 // 落库是 NULL 而不是空串。
 func (r *TaskRepo) MarkFailed(ctx context.Context, taskUID string, errMsg *string) (bool, error) {
-	return r.cas(ctx, taskUID, []string{"pending", "running"}, map[string]any{
-		"status":      "failed",
+	return r.cas(ctx, taskUID, []string{model.TaskPending, model.TaskRunning}, map[string]any{
+		"status":      model.TaskFailed,
 		"error_msg":   errMsg,
+		"finished_at": time.Now(),
+	})
+}
+
+// MarkCanceled 把任务标记为已取消。
+//
+// from 和 MarkSucceeded / MarkFailed 完全一样,这不是巧合:
+// 这三个都是「从中间态推到终态」,谁先到谁赢,后到的那个拿到 false。
+// 用户点取消和 Agent 报完成撞在一起时,这一条 UPDATE 的行锁就是仲裁者,
+// 不需要在上层加锁,也不需要先查再写。
+func (r *TaskRepo) MarkCanceled(ctx context.Context, taskUID string) (bool, error) {
+	return r.cas(ctx, taskUID, []string{model.TaskPending, model.TaskRunning}, map[string]any{
+		"status":      model.TaskCanceled,
 		"finished_at": time.Now(),
 	})
 }
