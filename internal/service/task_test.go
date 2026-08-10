@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 
+	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
 )
@@ -18,7 +19,7 @@ func TestCancel_MarksCanceled(t *testing.T) {
 		ctx := context.Background()
 		userID, uid := seedTask(t, r)
 
-		got, err := s.Cancel(ctx, userID, uid)
+		got, err := s.Cancel(ctx, userID, &agentv1.CancelTaskRequest{TaskUid: uid})
 		if err != nil {
 			t.Fatalf("Cancel: %v", err)
 		}
@@ -43,7 +44,7 @@ func TestCancel_LateCallbackCannotRevive(t *testing.T) {
 		ctx := context.Background()
 		userID, uid := seedTask(t, r)
 
-		if _, err := s.Cancel(ctx, userID, uid); err != nil {
+		if _, err := s.Cancel(ctx, userID, &agentv1.CancelTaskRequest{TaskUid: uid}); err != nil {
 			t.Fatalf("Cancel: %v", err)
 		}
 
@@ -73,8 +74,8 @@ func TestCancel_OtherUsersTaskLooksMissing(t *testing.T) {
 		_, uid := seedTask(t, r)
 		intruderID, _ := seedTask(t, r)
 
-		_, errMine := s.Cancel(ctx, intruderID, uid)
-		_, errGone := s.Cancel(ctx, intruderID, "01J8ZQXK7PZZZZZZZZZZZZZZZZ")
+		_, errMine := s.Cancel(ctx, intruderID, &agentv1.CancelTaskRequest{TaskUid: uid})
+		_, errGone := s.Cancel(ctx, intruderID, &agentv1.CancelTaskRequest{TaskUid: "01J8ZQXK7PZZZZZZZZZZZZZZZZ"})
 
 		if !errors.Is(errMine, model.ErrTaskNotFound) {
 			t.Errorf("取消别人的任务 = %v, 期望 ErrTaskNotFound", errMine)
@@ -106,7 +107,7 @@ func TestCancel_AlreadyTerminal(t *testing.T) {
 			t.Fatalf("MarkSucceeded: %v", err)
 		}
 
-		_, err := s.Cancel(ctx, userID, uid)
+		_, err := s.Cancel(ctx, userID, &agentv1.CancelTaskRequest{TaskUid: uid})
 		if !errors.Is(err, model.ErrTaskNotCancelable) {
 			t.Fatalf("Cancel = %v, 期望 ErrTaskNotCancelable", err)
 		}
@@ -121,7 +122,7 @@ func TestCancel_AgentFailureDoesNotFailTheRequest(t *testing.T) {
 		ag.err = errors.New("connection refused")
 		userID, uid := seedTask(t, r)
 
-		got, err := s.Cancel(ctx, userID, uid)
+		got, err := s.Cancel(ctx, userID, &agentv1.CancelTaskRequest{TaskUid: uid})
 		if err != nil {
 			t.Fatalf("Agent 挂了不该让取消失败: %v", err)
 		}
@@ -138,7 +139,7 @@ func TestCancel_NilAgent(t *testing.T) {
 	s := NewTaskService(r, nil)
 	userID, uid := seedTask(t, r)
 
-	if _, err := s.Cancel(context.Background(), userID, uid); err != nil {
+	if _, err := s.Cancel(context.Background(), userID, &agentv1.CancelTaskRequest{TaskUid: uid}); err != nil {
 		t.Fatalf("未注入 Agent 不该让取消失败: %v", err)
 	}
 }

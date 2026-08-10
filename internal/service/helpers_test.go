@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/agent"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ptr"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
 )
@@ -53,6 +55,26 @@ func withTx(t *testing.T) *repository.Repository {
 	return repository.New(tx)
 }
 
+// withSvc 在独立事务里跑一个用例,service 由 newSvc 现场构造。
+//
+//	withSvc(t, NewSessionService, func(t *testing.T, s *SessionService, r *repository.Repository) {
+//		...
+//	})
+//
+// 只服务"构造函数除了 repo 什么都不要"的 service。AuthService 要 TokenIssuer、
+// TaskService 要 agent.Client,而且用例还得能拿到那个假的去断言 ——
+// 那两个用下面的 withAuthSvc / withTaskSvc。
+//
+// 别为了统一硬塞进来:把假依赖也做成类型参数的话,SessionService 那边
+// 就得传一个 struct{} 占位,读起来比现在多两个专用夹具更费劲。
+func withSvc[S any](t *testing.T, newSvc func(*repository.Repository) S,
+	fn func(t *testing.T, s S, r *repository.Repository)) {
+
+	t.Helper()
+	r := withTx(t)
+	fn(t, newSvc(r), r)
+}
+
 // ---- 认证 ----
 
 // fakeIssuer 记下拿到的 userID,顺便省掉真造一个 32 字节密钥。
@@ -69,12 +91,32 @@ func (f *fakeIssuer) Issue(userID int64) (string, time.Time, error) {
 	return "tok-" + strconv.FormatInt(userID, 10), time.Now().Add(time.Hour), nil
 }
 
-// withSvc 在独立事务里跑一个 AuthService 用例。
-func withSvc(t *testing.T, fn func(t *testing.T, s *AuthService, r *repository.Repository, iss *fakeIssuer)) {
+// withAuthSvc 在独立事务里跑一个 AuthService 用例,顺带把假签发器交给用例 ——
+// 好些断言要看它收到的 userID。
+func withAuthSvc(t *testing.T, fn func(t *testing.T, s *AuthService, r *repository.Repository, iss *fakeIssuer)) {
 	t.Helper()
-	repo := withTx(t)
+	r := withTx(t)
 	iss := &fakeIssuer{}
-	fn(t, NewAuthService(repo, iss), repo, iss)
+	fn(t, NewAuthService(r, iss), r, iss)
+}
+
+// ---- 会话 ----
+
+func seed(t *testing.T, r *repository.Repository) (userID int64, sess *model.Session, task *model.Task) {
+	t.Helper()
+	ctx := context.Background()
+
+	u, err := r.User.Create(ctx, uniqueEmail(),
+		"$2a$04$fakefakefakefakefakefakefakefakefakefakefa", nil)
+	if err != nil {
+		t.Fatalf("建用户: %v", err)
+	}
+	sess, task, err = NewSessionService(r).CreateWithFirstTask(ctx, u.ID,
+		ptr.To("测试会话"), ptr.To("跑一下"))
+	if err != nil {
+		t.Fatalf("建会话和任务失败: %v", err)
+	}
+	return u.ID, sess, task
 }
 
 // ---- 任务 ----
@@ -85,10 +127,10 @@ type fakeAgent struct {
 	err      error
 }
 
-func (f *fakeAgent) StartTask(context.Context, agent.StartTaskReq) error { return nil }
+func (f *fakeAgent) StartTask(context.Context, agentclient.StartTaskReq) error { return nil }
 
-func (f *fakeAgent) CancelTask(_ context.Context, taskUID string) error {
-	f.canceled = append(f.canceled, taskUID)
+func (f *fakeAgent) CancelTask(_ context.Context, request *agentv1.CancelTaskRequest) error {
+	f.canceled = append(f.canceled, request.TaskUid)
 	return f.err
 }
 
@@ -103,17 +145,8 @@ func withTaskSvc(t *testing.T, fn func(t *testing.T, s *TaskService, r *reposito
 
 // seedTask 建一个用户、一个会话和一个 pending 任务,返回用户 id 和 task_uid。
 // 邮箱自动取唯一值,调用方不用操心。
-func seedTask(t *testing.T, r *repository.Repository) (userID int64, taskUID string) {
+func seedTask(t *testing.T, r *repository.Repository) (int64, string) {
 	t.Helper()
-	ctx := context.Background()
-
-	u, err := r.User.Create(ctx, uniqueEmail(), "$2a$04$fakefakefakefakefakefakefakefakefakefakefa", nil)
-	if err != nil {
-		t.Fatalf("建用户: %v", err)
-	}
-	_, task, err := NewSessionService(r).CreateWithFirstTask(ctx, u.ID, ptr.To("测试会话"), ptr.To("跑一下"))
-	if err != nil {
-		t.Fatalf("建会话和任务: %v", err)
-	}
-	return u.ID, task.TaskUID
+	uid, _, task := seed(t, r)
+	return uid, task.TaskUID
 }

@@ -3,6 +3,8 @@ package handler
 import (
 	"context"
 
+	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/trace"
 	"github.com/gin-gonic/gin"
 
 	"github.com/Jepson-Wang/mini_agent_backend/internal/handler/dto"
@@ -18,7 +20,7 @@ import (
 // 生产实现是 *service.TaskService。
 type TaskService interface {
 	GetTaskDetailByTaskID(ctx context.Context, userID int64, taskUID string) (*model.Task, error)
-	Cancel(ctx context.Context, userID int64, taskUID string) (*model.Task, error)
+	Cancel(ctx context.Context, userID int64, request *agentv1.CancelTaskRequest) (*model.Task, error)
 }
 
 // TaskHandler 处理用户对任务的操作。挂在私有路由组上,必须有登录态。
@@ -79,10 +81,28 @@ func (h *TaskHandler) Cancel(c *gin.Context) {
 		return
 	}
 
+	// 取消理由是可选的,客户端完全可以不带 body ——
+	// gin 的 ShouldBindJSON 碰上空 body 报 io.EOF,不先挡一下会把
+	// "我就是想取消"变成 40000。带了 body 就照常走 bindJSON,
+	// 失败时它已经把响应写好了,这里直接 return。
+	var req dto.CancelTaskReasonReq
+	if c.Request.ContentLength != 0 && !bindJSON(c, &req) {
+		return
+	}
+
+	// trace_id 由 TraceID 中间件种在最外层,取不到也只是链路断一截,
+	// 不该因此拒掉一次取消 —— 库里的状态才是要紧的那个。
+	traceID := trace.FromGin(c)
+
 	// MustUserID 取不到会 panic,那说明这条路由忘了挂 Auth ——
 	// 是接线 bug,早点炸出来好过默默拿 0 当用户 id 去查别人的数据。
 	// Recovery 会兜住,对外是 50000。
-	t, err := h.svc.Cancel(c.Request.Context(), middleware.MustUserID(c), uid)
+	t, err := h.svc.Cancel(c.Request.Context(), middleware.MustUserID(c),
+		&agentv1.CancelTaskRequest{
+			TaskUid: uid,
+			Reason:  req.Reason,
+			TraceId: traceID,
+		})
 	if err != nil {
 		response.FailFromError(c, err)
 		return

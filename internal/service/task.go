@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/agent"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/trace"
@@ -20,7 +21,7 @@ const notifyTimeout = 3 * time.Second
 // TaskService 负责任务的读取、取消,以及消费 Agent 报上来的状态回调。
 type TaskService struct {
 	repo  *repository.Repository
-	agent agent.Client
+	agent agentclient.Client
 }
 
 // NewTaskService 组装任务服务。
@@ -28,7 +29,7 @@ type TaskService struct {
 // ag 传 nil 表示 Agent 还没接上:取消照样落库,只是通知发不出去,
 // 会记一条 Warn。不设计成"没有 Agent 就报错" —— 库里的状态才是权威,
 // 通知只是让对面早点收手。
-func NewTaskService(repo *repository.Repository, ag agent.Client) *TaskService {
+func NewTaskService(repo *repository.Repository, ag agentclient.Client) *TaskService {
 	return &TaskService{repo: repo, agent: ag}
 }
 
@@ -46,7 +47,8 @@ func (s *TaskService) GetTaskDetailByTaskID(ctx context.Context, userID int64,
 // 于是我们紧接着把一个已经跑完的任务盖成 canceled,用户看到的状态是错的。
 // 先写 canceled 则相反:迟到的回调撞上 CAS 的 from=[pending,running],
 // 自然落空,不用额外加锁。
-func (s *TaskService) Cancel(ctx context.Context, userID int64, taskUID string) (*model.Task, error) {
+func (s *TaskService) Cancel(ctx context.Context, userID int64, request *agentv1.CancelTaskRequest) (*model.Task, error) {
+	taskUID := request.TaskUid
 	t, err := s.mustOwn(ctx, userID, taskUID)
 	if err != nil {
 		return nil, err
@@ -68,7 +70,7 @@ func (s *TaskService) Cancel(ctx context.Context, userID int64, taskUID string) 
 		return nil, fmt.Errorf("%w: 状态已被并发改写", model.ErrTaskNotCancelable)
 	}
 
-	s.notifyCancel(ctx, taskUID)
+	s.notifyCancel(ctx, request)
 
 	// 重新查一次。上面那份 t 是 UPDATE 之前读的,status / finished_at
 	// / updated_at 都已经过期,直接返回它等于骗客户端。
@@ -80,8 +82,9 @@ func (s *TaskService) Cancel(ctx context.Context, userID int64, taskUID string) 
 // 库里已经是 canceled,那才是权威状态;通知不到顶多让 Agent 白跑一会儿,
 // 它回来的结果会被 CAS 丢掉。为了一次通知失败就把用户的取消判为失败,
 // 会让用户重试 —— 而重试同样会失败,因为任务已经是终态了。
-func (s *TaskService) notifyCancel(ctx context.Context, taskUID string) {
+func (s *TaskService) notifyCancel(ctx context.Context, request *agentv1.CancelTaskRequest) {
 	traceID := trace.FromContext(ctx)
+	taskUID := request.TaskUid
 
 	if s.agent == nil {
 		slog.Warn("未注入 Agent 客户端,取消只落了库",
@@ -95,7 +98,7 @@ func (s *TaskService) notifyCancel(ctx context.Context, taskUID string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), notifyTimeout)
 	defer cancel()
 
-	if err := s.agent.CancelTask(ctx, taskUID); err != nil {
+	if err := s.agent.CancelTask(ctx, request); err != nil {
 		slog.Warn("通知 Agent 取消任务失败",
 			"task_uid", taskUID, "trace_id", traceID, "error", err)
 	}

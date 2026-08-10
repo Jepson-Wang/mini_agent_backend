@@ -19,7 +19,7 @@ import (
 )
 
 func TestRegister_OK(t *testing.T) {
-	withSvc(t, func(t *testing.T, s *AuthService, r *repository.Repository, iss *fakeIssuer) {
+	withAuthSvc(t, func(t *testing.T, s *AuthService, r *repository.Repository, iss *fakeIssuer) {
 		ctx := context.Background()
 		email := uniqueEmail()
 
@@ -60,7 +60,7 @@ func TestRegister_OK(t *testing.T) {
 
 // 昵称没填要存成 NULL,不是空串 —— 否则库里会有两种"没有昵称"。
 func TestRegister_BlankNicknameIsNull(t *testing.T) {
-	withSvc(t, func(t *testing.T, s *AuthService, r *repository.Repository, _ *fakeIssuer) {
+	withAuthSvc(t, func(t *testing.T, s *AuthService, r *repository.Repository, _ *fakeIssuer) {
 		cred, err := s.Register(context.Background(), uniqueEmail(), testPassword, "   ")
 		if err != nil {
 			t.Fatalf("Register: %v", err)
@@ -74,7 +74,7 @@ func TestRegister_BlankNicknameIsNull(t *testing.T) {
 // 邮箱大小写不同不能算两个账号。唯一索引比的是字节,不管大小写,
 // 所以规范化必须在业务层做,而且注册和登录得用同一套规则。
 func TestRegister_EmailIsCaseInsensitive(t *testing.T) {
-	withSvc(t, func(t *testing.T, s *AuthService, _ *repository.Repository, _ *fakeIssuer) {
+	withAuthSvc(t, func(t *testing.T, s *AuthService, _ *repository.Repository, _ *fakeIssuer) {
 		ctx := context.Background()
 		lower := uniqueEmail()
 		upper := strings.ToUpper(lower)
@@ -98,7 +98,7 @@ func TestRegister_EmailIsCaseInsensitive(t *testing.T) {
 }
 
 func TestLogin_OK(t *testing.T) {
-	withSvc(t, func(t *testing.T, s *AuthService, _ *repository.Repository, iss *fakeIssuer) {
+	withAuthSvc(t, func(t *testing.T, s *AuthService, _ *repository.Repository, iss *fakeIssuer) {
 		ctx := context.Background()
 		email := uniqueEmail()
 
@@ -126,7 +126,7 @@ func TestLogin_OK(t *testing.T) {
 // 这条是登录接口最重要的一条不变式:
 // "邮箱不存在"和"口令不对"必须是同一个错误,否则接口就是账号枚举器。
 func TestLogin_FailuresAreIndistinguishable(t *testing.T) {
-	withSvc(t, func(t *testing.T, s *AuthService, _ *repository.Repository, _ *fakeIssuer) {
+	withAuthSvc(t, func(t *testing.T, s *AuthService, _ *repository.Repository, _ *fakeIssuer) {
 		ctx := context.Background()
 		email := uniqueEmail()
 		if _, err := s.Register(ctx, email, testPassword, ""); err != nil {
@@ -153,7 +153,7 @@ func TestLogin_FailuresAreIndistinguishable(t *testing.T) {
 // 禁用的账号不能登录。注意 Login 是先验口令再看状态 ——
 // 反过来的话,不知道口令也能问出某个邮箱是否注册过。
 func TestLogin_DisabledUser(t *testing.T) {
-	withSvc(t, func(t *testing.T, s *AuthService, r *repository.Repository, _ *fakeIssuer) {
+	withAuthSvc(t, func(t *testing.T, s *AuthService, r *repository.Repository, _ *fakeIssuer) {
 		ctx := context.Background()
 		email := uniqueEmail()
 
@@ -179,7 +179,7 @@ func TestLogin_DisabledUser(t *testing.T) {
 }
 
 func TestLogin_RecordsLastLoginAt(t *testing.T) {
-	withSvc(t, func(t *testing.T, s *AuthService, r *repository.Repository, _ *fakeIssuer) {
+	withAuthSvc(t, func(t *testing.T, s *AuthService, r *repository.Repository, _ *fakeIssuer) {
 		ctx := context.Background()
 		email := uniqueEmail()
 
@@ -211,7 +211,7 @@ func TestLogin_RecordsLastLoginAt(t *testing.T) {
 // cost 调高之后,老账号的散列要在下次登录时顺手升级 ——
 // 散列不可逆,用户手上有明文的这一刻是唯一的迁移时机。
 func TestLogin_RehashesWhenCostIncreases(t *testing.T) {
-	withSvc(t, func(t *testing.T, s *AuthService, r *repository.Repository, _ *fakeIssuer) {
+	withAuthSvc(t, func(t *testing.T, s *AuthService, r *repository.Repository, _ *fakeIssuer) {
 		ctx := context.Background()
 		email := uniqueEmail()
 
@@ -251,7 +251,7 @@ func TestLogin_RehashesWhenCostIncreases(t *testing.T) {
 
 // 签发失败不能悄悄返回一个没有令牌的登录态。
 func TestIssueFailurePropagates(t *testing.T) {
-	withSvc(t, func(t *testing.T, s *AuthService, _ *repository.Repository, iss *fakeIssuer) {
+	withAuthSvc(t, func(t *testing.T, s *AuthService, _ *repository.Repository, iss *fakeIssuer) {
 		iss.err = errors.New("签发器坏了")
 
 		if _, err := s.Register(context.Background(), uniqueEmail(), testPassword, ""); err == nil {

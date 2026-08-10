@@ -60,6 +60,11 @@ type CreateSessionReq struct {
 	Input *string `json:"input" binding:"omitempty,max=8000"`
 }
 
+// CancelTaskReasonReq
+type CancelTaskReasonReq struct {
+	Reason string `json:"reason" binding:"max=20"`
+}
+
 // UpdateSessionTitleReq 改标题。
 //
 // Title 是 *string 且 required,意思是"这个字段必须出现在 body 里"。

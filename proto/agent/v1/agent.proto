@@ -5,18 +5,59 @@ package agent.v1;
 option go_package = "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1;agentv1";
 
 service AgentService {
-  rpc Run(RunRequest) returns (RunResponse);
+  //创建
+
+  // 服务端流式：任务执行过程中吃顺序推送事件
+  rpc RunTask(RunTaskRequest) returns (stream TaskEvent);
+
+  //一元调用
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+
+  //健康检查
+  rpc Health(HealthRequest) returns (HealthResponse);
 }
 
-message RunRequest {
-  string session_id   = 1;
-  string user_message = 2;
-  int32  max_turns    = 3;
+message RunTaskRequest {
+  string task_uid   = 1;
+  string session_id = 2;
+  string input      = 3;
+  string trace_id   = 4;
 }
 
-message RunResponse {
-  string session_id     = 1;
-  string final_response = 2;
-  bool   completed      = 3;
-  int32  used_turns     = 4;
+message CancelTaskRequest {
+  string task_uid = 1;
+  string reason = 2;
+  string trace_id = 3;
+}
+
+message HealthRequest {
+
+}
+
+message CancelTaskResponse {
+  bool cancelled = 1;
+  string message = 2;
+}
+
+message HealthResponse {
+  bool ok = 1;
+  string version = 2;
+}
+
+message TaskEvent {
+  string task_uid = 1;
+  EventType type = 2;
+  int64 seq = 3;
+  string payload = 4;
+  int64 timestamp = 5;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_STARTED = 1;
+  EVENT_TYPE_THINKING = 2;
+  EVENT_TYPE_TOOL_CALL = 3;
+  EVENT_TYPE_TOOL_RESULT = 4;
+  EVENT_TYPE_FINISHED = 5;
+  EVENT_TYPE_ERROR = 6;
 }

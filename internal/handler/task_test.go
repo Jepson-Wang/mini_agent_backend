@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/handler"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ptr"
@@ -51,9 +52,9 @@ func (f *fakeTask) GetTaskDetailByTaskID(_ context.Context, userID int64, taskUI
 	return f.task, f.err
 }
 
-func (f *fakeTask) Cancel(_ context.Context, userID int64, taskUID string) (*model.Task, error) {
+func (f *fakeTask) Cancel(_ context.Context, userID int64, req *agentv1.CancelTaskRequest) (*model.Task, error) {
 	f.cancelCall++
-	f.gotUserID, f.gotUID = userID, taskUID
+	f.gotUserID, f.gotUID = userID, req.TaskUid
 	return f.task, f.err
 }
 
