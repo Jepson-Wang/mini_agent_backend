@@ -158,6 +158,10 @@ type TaskResp struct {
 	// 写这个值的地方(dto.TaskCallbackReq)必须限长,否则这里会跟着一起爆。
 	ErrorMsg *string `json:"error_msg"`
 
+	// CancelReason 是用户自己填的取消理由,原样回显。
+	// 不是终态 canceled 的任务这里恒为 null。
+	CancelReason *string `json:"cancel_reason"`
+
 	StartedAt  *time.Time `json:"started_at"`
 	FinishedAt *time.Time `json:"finished_at"`
 	CreatedAt  time.Time  `json:"created_at"`
@@ -170,11 +174,13 @@ func NewTaskResp(t *model.Task) *TaskResp {
 		return nil
 	}
 	return &TaskResp{
-		TaskUID:    t.TaskUID,
-		SessionID:  t.SessionID,
-		Status:     t.Status,
-		Input:      t.Input,
-		ErrorMsg:   t.ErrorMsg,
+		TaskUID:      t.TaskUID,
+		SessionID:    t.SessionID,
+		Status:       t.Status,
+		Input:        t.Input,
+		ErrorMsg:     t.ErrorMsg,
+		CancelReason: t.CancelReason,
+
 		StartedAt:  t.StartedAt,
 		FinishedAt: t.FinishedAt,
 		CreatedAt:  t.CreatedAt,

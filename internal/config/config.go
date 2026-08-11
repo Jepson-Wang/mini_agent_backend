@@ -43,8 +43,18 @@ type Database struct {
 	DSN string `yaml:"dsn"`
 }
 
+// DefaultAgentTaskTimeout 一个任务的事件流最多跑多久。
+//
+// 给得比 HTTP 那边宽松得多:Agent 跑一轮 LLM 循环几分钟很正常,
+// 这个上限只是兜底,防止对面不吭声时消费协程永远挂着(Close 会等它)。
+const DefaultAgentTaskTimeout = 30 * time.Minute
+
 type Agent struct {
 	Addr string `yaml:"addr"`
+
+	// TaskTimeout 单个任务事件流的上限,支持 "30m" / "1h" 这种写法。
+	// 到点整条流会被掐断,任务在库里停在最后一次收到的状态。
+	TaskTimeout time.Duration `yaml:"task_timeout"`
 
 	// CallbackSecret 是 Agent 回调本服务时用的共享密钥,
 	// 只从 AGENT_CALLBACK_SECRET 读。yaml:"-" 的理由和 JWT.Secret 一样。
@@ -78,7 +88,10 @@ type JWT struct {
 func defaults() Config {
 	return Config{
 		Server: Server{Addr: ":8080"},
-		Agent:  Agent{Addr: "localhost:50051"},
+		Agent: Agent{
+			Addr:        "localhost:50051",
+			TaskTimeout: DefaultAgentTaskTimeout,
+		},
 		JWT: JWT{
 			Issuer:    "mini-agent",
 			AccessTTL: 2 * time.Hour,
@@ -164,6 +177,13 @@ func (c *Config) applyEnv() error {
 		}
 		c.JWT.AccessTTL = d
 	}
+	if v := strings.TrimSpace(os.Getenv("AGENT_TASK_TIMEOUT")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("AGENT_TASK_TIMEOUT=%q 不是合法的时长(例:30m、1h): %w", v, err)
+		}
+		c.Agent.TaskTimeout = d
+	}
 	return nil
 }
 
@@ -196,6 +216,12 @@ func (c *Config) Validate() error {
 	if len(c.JWT.Secret) < minSecretLen {
 		// 不把密钥本身写进错误里 —— 这条会进启动日志。
 		return fmt.Errorf("JWT_SECRET 至少 %d 字节,当前 %d 字节", minSecretLen, len(c.JWT.Secret))
+	}
+	if c.Agent.Addr == "" {
+		return fmt.Errorf("agent.addr 不能为空(可用 AGENT_ADDR 环境变量提供)")
+	}
+	if c.Agent.TaskTimeout <= 0 {
+		return fmt.Errorf("agent.task_timeout 必须大于 0,当前为 %v", c.Agent.TaskTimeout)
 	}
 	// 空表示不启用 /internal(那组接口会一律 500),但填了就必须够长。
 	// "填了个 8 位的" 比 "没填" 危险得多:前者会让人以为已经防住了。

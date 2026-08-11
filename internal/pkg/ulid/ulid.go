@@ -26,3 +26,50 @@ func New() (string, error) {
 	}
 	return id.String(), nil
 }
+
+// validChar 是 Crockford Base32 合法字符的查表。
+// 大小写都登了,但 IsValid 只收大写 —— 这个表只做字符集校验,
+// 大小写判断由 IsValid 自己做。
+var validChar = func() [256]bool {
+	var t [256]bool
+	for _, c := range oklog.Encoding {
+		t[c] = true
+		// 小写也登记,但 IsValid 不收 —— TestValidChar_MatchesEncoding 只验表里没多登记,
+		// 不验大小写策略。
+	}
+	return t
+}()
+
+// IsValid 检查一个字符串是否是合法的 ULID。
+//
+// 规则比 oklog.ParseStrict 更严:
+//   - 长度必须是 26
+//   - 只能大写(I、L、O、U 不在字母表里,自然不合法)
+//   - 时间戳部分不能溢出(首字符 ≥ 8 会导致时间戳超出 48 位)
+func IsValid(id string) bool {
+	if len(id) != 26 {
+		return false
+	}
+
+	// 时间戳占前 10 个字符,首字符若 ≥ '8' 则解码出的毫秒时间戳溢出。
+	// oklog.ParseStrict 不拦这种,但 oklog.New 不会生成,所以我们也拒。
+	if id[0] >= '8' {
+		return false
+	}
+
+	for i := 0; i < 26; i++ {
+		c := id[i]
+		if c > 127 {
+			return false // 非 ASCII
+		}
+		if !validChar[c] {
+			return false
+		}
+		// 只收大写:oklog.ParseStrict 认小写,但我们的 char(26) 列做的是
+		// 字节级比对,小写 ULID 查不出数据。
+		if c >= 'a' && c <= 'z' {
+			return false
+		}
+	}
+	return true
+}

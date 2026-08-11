@@ -113,6 +113,7 @@ repository 数据访问,负责把 gorm/驱动错误翻译成 model.Err*
 - `TestMain` 全包只能有一个，内部包和外部包各放一个也会报 `multiple definitions of TestMain`。拆多个测试文件时，共享的 `TestMain` / `testDB` / helper 集中放 `main_test.go`。
 - **Postgres 25P02 坑**：一次约束冲突会让整个外层事务进入 aborted 状态，后续语句全失败。所以**期望失败的插入必须是该用例的最后一条语句**（见 `TestRegister_EmailIsCaseInsensitive`）。
 - handler 测试用 `package handler_test` + 假 service，走完整 router round-trip，不连库。
+- **`AutoMigrate` 必须包在 `migrateTestDB` 的 advisory 锁里**（`repository` 和 `service` 各有一份，锁常量要一致）。`go test ./...` 并行跑包，两个 `TestMain` 同时 `ADD COLUMN` 会有一个拿到 `42701 column already exists`，整包 `log.Fatal`。平时迁移是空操作看不出来，**只在加了新列之后的第一次跑挂**，第二次就好了 —— 很容易被当成偶发放过去。
 
 ## 任务状态机
 
@@ -158,6 +159,14 @@ pending ──► running ──┐
 
 `AGENT_CALLBACK_SECRET` **不是启动必填**（和 `JWT_SECRET` 不同）：缺了只是 `/internal` 那组接口一律 500，服务其余部分照常。但填了就必须 ≥32 字节，且不能和 `JWT_SECRET` 相同。
 
-`agent.Client` 只有接口没有实现，`main.go` 里传的是 `nil`：取消照常落库，只是通知发不出去，会记一条 Warn。
+`AGENT_ADDR`（默认 `localhost:50051`）和 `AGENT_TASK_TIMEOUT`（默认 `30m`）都有默认值，但都会过 `Validate`：空地址、非正的超时一律启动失败。
+
+`agentclient` 包（目录 `internal/agentclient`）是 Agent 那侧 gRPC 服务的客户端，**唯一允许出现 `gen/agent/v1` 的地方**（除了它自己和 `cmd/grpcprobe`）。上层收发的是 `StartTaskReq` / `CancelTaskReq` 这种本地结构 —— 让 handler 或 service 去拼 protobuf message，等于 proto 一改两层都得重写。
+
+`agentclient.GRPCClient` 已经实现了 `Client`，但 `main.go` 里传的仍然是 `nil`（还缺一个把事件写回 tasks 表的 `EventHandler`）：取消照常落库，只是通知发不出去，会记一条 Warn。`var _ Client = (*GRPCClient)(nil)` 那行别删 —— 生产代码没有任何一处做这个赋值，少了它接口和实现漂移了编译器不会吭声。
+
+`StartTask` 起的消费协程要活过发起它的那次 HTTP 请求，所以 ctx 必须先 `context.WithoutCancel` 再配自己的超时（`AGENT_TASK_TIMEOUT`，默认 30 分钟）。直接从请求 ctx 派生的话，handler 一 return 整条事件流就断了。
+
+`cmd/grpcprobe` 是连通性探针：`AGENT_ADDR=host:port go run ./cmd/grpcprobe`。它走的是和生产同一条路径（`StartTask` + `EventHandler`），不绕过 `Client` 接口 —— 探针通了才说明业务那条路也通。
 
 已知未做：登录没有限流（`handler/auth.go` 有 TODO，bcrypt 的耗时拦不住撞库）；JWT 没有吊销机制（`jti` 已签进去，是将来做黑名单的钩子）；`Login` 里"用户不存在"分支比"口令错"少跑一次 bcrypt，存在约 160ms 的时间侧信道（代码注释里写明了）；`/internal` 目前和业务接口共用一个监听端口，生产上应该单独端口或由网关按前缀挡在公网外。
