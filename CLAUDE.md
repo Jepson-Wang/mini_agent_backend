@@ -161,7 +161,13 @@ pending ──► running ──┐
 
 `AGENT_ADDR`（默认 `localhost:50051`）和 `AGENT_TASK_TIMEOUT`（默认 `30m`）都有默认值，但都会过 `Validate`：空地址、非正的超时一律启动失败。
 
-`agentclient` 包（目录 `internal/agentclient`）是 Agent 那侧 gRPC 服务的客户端，**唯一允许出现 `gen/agent/v1` 的地方**（除了它自己和 `cmd/grpcprobe`）。上层收发的是 `StartTaskReq` / `CancelTaskReq` 这种本地结构 —— 让 handler 或 service 去拼 protobuf message，等于 proto 一改两层都得重写。
+`agentclient` 包（目录 `internal/agentclient`）是 Agent 那侧 gRPC 服务的客户端，**全仓库唯一允许 import `gen/agent/v1` 的地方，没有例外**（包括 `cmd/grpcprobe`）。
+
+进出这个包的一律是本地类型：`StartTaskReq` / `CancelTaskReq` / `Event`（含 `EventType` 那组字符串常量和 `IsTerminal`）。proto 类型能走到的最远处是 `toEvent` 和 `CancelTask` 里那次翻译。**别把 wire 类型顶到业务层** —— 对面改一次字段名、加一个枚举值，handler、service 和两边的测试就会一起红，而那本该是实现细节。
+
+这条规矩由 `internal/agentclient/imports_test.go` 的 `TestOnlyAgentClientImportsProto` 守着：它遍历整个仓库解析 import。配套的 `TestProtoPkgIsActuallyImportedHere` 防的是常量过期后前者一直绿着却什么也没查。要加东西就在 `agentclient` 里加一个本地类型，照 `Event` / `CancelTaskReq` 的样子来。
+
+未知的事件类型翻成 `EventUnknown` 后**照样往下发**（payload 还在），只是多记一条 Warn —— 直接丢弃的话，「对面升级了、我们没跟上」这件事没人会发现。
 
 `agentclient.GRPCClient` 已经实现了 `Client`，但 `main.go` 里传的仍然是 `nil`（还缺一个把事件写回 tasks 表的 `EventHandler`）：取消照常落库，只是通知发不出去，会记一条 Warn。`var _ Client = (*GRPCClient)(nil)` 那行别删 —— 生产代码没有任何一处做这个赋值，少了它接口和实现漂移了编译器不会吭声。
 

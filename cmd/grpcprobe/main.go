@@ -15,7 +15,6 @@ import (
 	"os"
 	"time"
 
-	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/agentclient"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/config"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ulid"
@@ -35,13 +34,13 @@ func fatal(msg string, err error) {
 // probeHandler 把事件原样打出来。done 在流结束时关闭,让 main 知道可以收工了。
 type probeHandler struct{ done chan struct{} }
 
-func (h probeHandler) OnEvent(_ context.Context, ev *agentv1.TaskEvent) error {
+func (h probeHandler) OnEvent(_ context.Context, ev agentclient.Event) error {
 	slog.Info("事件",
-		"seq", ev.Seq, "type", ev.Type.String(), "payload", ev.Payload)
+		"seq", ev.Seq, "type", string(ev.Type),
+		"payload", ev.Payload, "at", ev.Timestamp)
 
 	// 终态事件之后不会再有东西了,不用干等到超时。
-	switch ev.Type {
-	case agentv1.EventType_EVENT_TYPE_FINISHED, agentv1.EventType_EVENT_TYPE_ERROR:
+	if ev.Type.IsTerminal() {
 		close(h.done)
 	}
 	return nil

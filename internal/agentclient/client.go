@@ -1,9 +1,13 @@
 // Package agentclient 是 Agent 那侧 gRPC 服务的客户端。
 //
 // 本服务是 HTTP server + gRPC **client**,Agent 才是 gRPC server。
-// 这个包是唯一允许出现 gen/agent/v1 的地方(除了它自己的测试和探针):
-// 上层拿到的是 StartTaskReq / CancelTaskReq 这种本地结构,
-// proto 改字段名不该让 handler 跟着重编译。
+// **这个包是整个仓库里唯一允许 import gen/agent/v1 的地方**,
+// imports_test.go 里有一条测试盯着这件事。
+//
+// 进出这个包的都是本地类型:StartTaskReq / CancelTaskReq / Event。
+// 让 proto 类型跑到 service 或 handler 里去的话,Agent 那边改一次
+// 字段名或者加一个枚举值,业务代码就得跟着动 —— 而那是 wire 格式的
+// 实现细节,不该是业务的 API 契约。
 package agentclient
 
 import (
@@ -73,17 +77,96 @@ type CancelTaskReq struct {
 	TraceID string
 }
 
+// EventType 是任务事件的类型。
+//
+// 用自己的字符串常量而不是把 agentv1.EventType 透出去:消费方 switch 的
+// 应该是稳定的业务概念,而 proto 那个枚举是 wire 格式的一部分 ——
+// 对面加一个值、改一次名字,不该让 service 和 handler 跟着重编译。
+type EventType string
+
+const (
+	// EventUnknown 是我们还不认识的事件类型。不丢弃是刻意的:
+	// payload 还在,记下来才能发现"对面升级了、我们没跟上"。
+	EventUnknown EventType = "unknown"
+
+	EventStarted    EventType = "started"
+	EventThinking   EventType = "thinking"
+	EventToolCall   EventType = "tool_call"
+	EventToolResult EventType = "tool_result"
+	EventFinished   EventType = "finished"
+	EventError      EventType = "error"
+)
+
+// IsTerminal 报告这条事件之后还会不会有别的事件。
+//
+// 未知类型按「不是终态」处理,和 model.IsTerminal 同一个取向:
+// 宁可多等一会儿(等流自己 EOF),也不要漏掉后面真正的结果。
+func (t EventType) IsTerminal() bool {
+	return t == EventFinished || t == EventError
+}
+
+// Event 是一条任务事件,由 agentclient 从 gRPC 的 TaskEvent 翻过来。
+type Event struct {
+	TaskUID string
+	Type    EventType
+
+	// Seq 单调递增,从 1 开始,用来排序和去重。
+	Seq int64
+
+	// Payload 是这条事件的内容:思考文本、工具调用参数、错误原因……
+	// 按 Type 解释。
+	Payload string
+
+	// Timestamp 是事件在 Agent 那边发生的时刻。对面没给就是零值。
+	Timestamp time.Time
+}
+
 // EventHandler 消费任务事件流。实现方负责把事件落到业务上
-// (比如把 running / finished 写进 tasks 表)。
+// (比如把 started / finished 写进 tasks 表)。
 //
 // 两个方法都在后台协程里被调用,别在里面做阻塞很久的事。
 type EventHandler interface {
 	// OnEvent 收到一条事件。返回错误只会被记日志,流不会因此中断 ——
 	// 一条事件处理失败不该让后面的事件全都收不到。
-	OnEvent(ctx context.Context, ev *agentv1.TaskEvent) error
+	OnEvent(ctx context.Context, ev Event) error
 
 	// OnStreamError 流异常结束。正常结束(EOF)不会走到这里。
 	OnStreamError(ctx context.Context, taskUID string, err error)
+}
+
+// eventTypes 把 proto 的枚举翻成本地类型。
+// 对面加了新值而这里没跟上时,toEvent 会给 EventUnknown,不会静默当成别的。
+var eventTypes = map[agentv1.EventType]EventType{
+	agentv1.EventType_EVENT_TYPE_STARTED:     EventStarted,
+	agentv1.EventType_EVENT_TYPE_THINKING:    EventThinking,
+	agentv1.EventType_EVENT_TYPE_TOOL_CALL:   EventToolCall,
+	agentv1.EventType_EVENT_TYPE_TOOL_RESULT: EventToolResult,
+	agentv1.EventType_EVENT_TYPE_FINISHED:    EventFinished,
+	agentv1.EventType_EVENT_TYPE_ERROR:       EventError,
+}
+
+// toEvent 把一条 protobuf 事件翻成本地事件。
+// 这是 proto 类型能走到的最远的地方,再往外一步就是业务代码了。
+func toEvent(ev *agentv1.TaskEvent) Event {
+	t, ok := eventTypes[ev.Type]
+	if !ok {
+		t = EventUnknown
+	}
+
+	// timestamp 是 Unix 毫秒。没给(0)时留零值,不要翻成 1970 —— 那会让
+	// "对面没填"看起来像"一条 55 年前的事件",排查时很误导。
+	var ts time.Time
+	if ev.Timestamp != 0 {
+		ts = time.UnixMilli(ev.Timestamp)
+	}
+
+	return Event{
+		TaskUID:   ev.TaskUid,
+		Type:      t,
+		Seq:       ev.Seq,
+		Payload:   ev.Payload,
+		Timestamp: ts,
+	}
 }
 
 type GRPCClient struct {
@@ -210,10 +293,18 @@ func (c *GRPCClient) consume(ctx context.Context, taskUID string,
 				"want", taskUID, "got", ev.TaskUid, "seq", ev.Seq)
 			continue
 		}
-		if err := c.handler.OnEvent(ctx, ev); err != nil {
-			// 处理失败不中断流:后面的事件(尤其是 FINISHED)还得收。
+
+		e := toEvent(ev)
+		if e.Type == EventUnknown {
+			// 照样往下发:payload 还在,消费方自己决定怎么处理。
+			// 但要留个记录,否则"对面升级了、我们没跟上"这件事没人会发现。
+			slog.Warn("收到未知类型的事件",
+				"task_uid", taskUID, "seq", ev.Seq, "raw_type", ev.Type.String())
+		}
+		if err := c.handler.OnEvent(ctx, e); err != nil {
+			// 处理失败不中断流:后面的事件(尤其是 finished)还得收。
 			slog.Warn("处理任务事件失败",
-				"task_uid", taskUID, "seq", ev.Seq, "type", ev.Type.String(), "error", err)
+				"task_uid", taskUID, "seq", e.Seq, "type", string(e.Type), "error", err)
 		}
 	}
 }
