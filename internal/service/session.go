@@ -3,8 +3,11 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
+	"github.com/Jepson-Wang/mini_agent_backend/internal/agentclient"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/trace"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ulid"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
 )
@@ -14,11 +17,17 @@ import (
 const listLimitDefault = 20
 
 type SessionService struct {
-	repo *repository.Repository
+	repo  *repository.Repository
+	agent agentclient.Client
 }
 
-func NewSessionService(repo *repository.Repository) *SessionService {
-	return &SessionService{repo: repo}
+// NewSessionService 组装会话服务。
+//
+// ag 是任务派发用的 Agent 客户端。传 nil 表示这个部署不派发任务:
+// 任务照常建出来,但会一直停在 pending,只记一条 Warn。
+// 和 TaskService 那边同一个取向 —— 库里的记录才是权威,派发是之后的事。
+func NewSessionService(repo *repository.Repository, ag agentclient.Client) *SessionService {
+	return &SessionService{repo: repo, agent: ag}
 }
 
 // CreateWithFirstTask 在一个事务里建会话和它的首个任务,
@@ -45,7 +54,75 @@ func (s *SessionService) CreateWithFirstTask(ctx context.Context,
 	if err != nil {
 		return nil, nil, err
 	}
-	return sess, task, nil
+
+	// 派发放在事务外面,理由见 dispatch 的注释。
+	return sess, s.dispatch(ctx, task), nil
+}
+
+// dispatch 把任务交给 Agent 去跑,返回派发之后的任务。
+//
+// **必须在事务提交之后调用。** Agent 是同步的,它可能在几毫秒内就把
+// started 事件推回来,而那条事件是按 task_uid 去 UPDATE 的 ——
+// 事务还没提交的话那一行对别的连接根本不可见,UPDATE 匹配不到任何行,
+// cas 返回 false(这在它眼里是"迟到的回调",不是错误),
+// 于是任务永远停在 pending。这种 bug 只在 Agent 快、库慢的时候出现,
+// 本地几乎复现不出来。
+//
+// 派发失败就地标记 failed,不是留在 pending:同步 Agent 只有这一次
+// 交接机会,交不出去就再也没人会推动它了。留在 pending 的话,
+// 用户界面上就是一个永远转圈的任务,而且没有任何地方能解释为什么。
+func (s *SessionService) dispatch(ctx context.Context, task *model.Task) *model.Task {
+	traceID := trace.FromContext(ctx)
+
+	if s.agent == nil {
+		slog.Warn("未注入 Agent 客户端,任务只建了记录没有派发",
+			"task_uid", task.TaskUID, "trace_id", traceID)
+		return task
+	}
+
+	var input string
+	if task.Input != nil {
+		input = *task.Input
+	}
+
+	err := s.agent.StartTask(ctx, agentclient.StartTaskReq{
+		TaskUID:   task.TaskUID,
+		SessionID: task.SessionID,
+		Input:     input,
+		TraceID:   traceID,
+	})
+	if err == nil {
+		return task
+	}
+
+	slog.Error("派发任务给 Agent 失败,标记为失败",
+		"task_uid", task.TaskUID, "trace_id", traceID, "error", err)
+
+	// 给用户看的原因不带 err 原文 —— 那里面是 gRPC 的地址和错误码。
+	msg := "任务派发失败:执行器暂时不可用"
+	applied, markErr := s.repo.Task.MarkFailed(ctx, task.TaskUID, &msg)
+	if markErr != nil {
+		// 记录已经在库里了,标记失败又失败 —— 只能记下来,
+		// 任务会停在 pending。不往上抛:任务确实建成功了。
+		slog.Error("派发失败后标记任务失败也失败了",
+			"task_uid", task.TaskUID, "trace_id", traceID, "error", markErr)
+		return task
+	}
+	if !applied {
+		// 没匹配到行说明状态已经被推动过了(极少见:StartTask 报错但
+		// 流其实建起来了,事件先落了地)。以库里的为准。
+		slog.Warn("派发失败但任务状态已被改动,不覆盖",
+			"task_uid", task.TaskUID, "trace_id", traceID)
+	}
+
+	// 重查一次,别把 UPDATE 之前那份过期数据交给客户端。
+	fresh, err := s.repo.Task.GetByUID(ctx, task.TaskUID)
+	if err != nil {
+		slog.Error("派发失败后重查任务失败",
+			"task_uid", task.TaskUID, "trace_id", traceID, "error", err)
+		return task
+	}
+	return fresh
 }
 
 // ListSessionsByUserID 根据用户 ID 返回 session 列表,带分页。
@@ -113,7 +190,9 @@ func (s *SessionService) CreateTaskWithSessionID(ctx context.Context, userID int
 	if err := s.repo.Task.Create(ctx, task); err != nil {
 		return nil, err
 	}
-	return task, nil
+
+	// Create 是单条写入,走到这里已经落库了,可以派发。
+	return s.dispatch(ctx, task), nil
 }
 
 // ListTasksWithSessionID 列出会话下的任务。

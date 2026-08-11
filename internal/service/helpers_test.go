@@ -54,26 +54,11 @@ func withTx(t *testing.T) *repository.Repository {
 	return repository.New(tx)
 }
 
-// withSvc 在独立事务里跑一个用例,service 由 newSvc 现场构造。
+// 这里原来有个泛型的 withSvc,专门服务"构造函数除了 repo 什么都不要"的
+// service。SessionService 加上 Agent 客户端之后,三个 service 就都有假依赖了,
+// 它一个用户也没剩下,所以删掉 —— 换成下面三个各自的夹具,
+// 用例还能顺手拿到那个假依赖去断言。
 //
-//	withSvc(t, NewSessionService, func(t *testing.T, s *SessionService, r *repository.Repository) {
-//		...
-//	})
-//
-// 只服务"构造函数除了 repo 什么都不要"的 service。AuthService 要 TokenIssuer、
-// TaskService 要 agent.Client,而且用例还得能拿到那个假的去断言 ——
-// 那两个用下面的 withAuthSvc / withTaskSvc。
-//
-// 别为了统一硬塞进来:把假依赖也做成类型参数的话,SessionService 那边
-// 就得传一个 struct{} 占位,读起来比现在多两个专用夹具更费劲。
-func withSvc[S any](t *testing.T, newSvc func(*repository.Repository) S,
-	fn func(t *testing.T, s S, r *repository.Repository)) {
-
-	t.Helper()
-	r := withTx(t)
-	fn(t, newSvc(r), r)
-}
-
 // ---- 认证 ----
 
 // fakeIssuer 记下拿到的 userID,顺便省掉真造一个 32 字节密钥。
@@ -101,6 +86,31 @@ func withAuthSvc(t *testing.T, fn func(t *testing.T, s *AuthService, r *reposito
 
 // ---- 会话 ----
 
+// withSessionSvc 在独立事务里跑一个 SessionService 用例,Agent 是假的。
+// 用例能拿到那个假 Agent,验"建完任务有没有派发出去"。
+func withSessionSvc(t *testing.T, fn func(t *testing.T, s *SessionService, r *repository.Repository, ag *fakeAgent)) {
+	t.Helper()
+	repo := withTx(t)
+	ag := &fakeAgent{}
+	fn(t, NewSessionService(repo, ag), repo, ag)
+}
+
+// seedUser 建一个用户,返回它的 id。邮箱自动取唯一值。
+func seedUser(t *testing.T, r *repository.Repository) int64 {
+	t.Helper()
+
+	u, err := r.User.Create(context.Background(), uniqueEmail(),
+		"$2a$04$fakefakefakefakefakefakefakefakefakefakefa", nil)
+	if err != nil {
+		t.Fatalf("建用户: %v", err)
+	}
+	return u.ID
+}
+
+// seed 建一个用户、一个会话和一个任务。
+//
+// 传 nil 当 Agent:这些用例关心的是数据,不是派发。要验派发的
+// 用 withSessionSvc,那里的假 Agent 会把 StartTask 记下来。
 func seed(t *testing.T, r *repository.Repository) (userID int64, sess *model.Session, task *model.Task) {
 	t.Helper()
 	ctx := context.Background()
@@ -110,7 +120,7 @@ func seed(t *testing.T, r *repository.Repository) (userID int64, sess *model.Ses
 	if err != nil {
 		t.Fatalf("建用户: %v", err)
 	}
-	sess, task, err = NewSessionService(r).CreateWithFirstTask(ctx, u.ID,
+	sess, task, err = NewSessionService(r, nil).CreateWithFirstTask(ctx, u.ID,
 		ptr.To("测试会话"), ptr.To("跑一下"))
 	if err != nil {
 		t.Fatalf("建会话和任务失败: %v", err)
@@ -120,13 +130,29 @@ func seed(t *testing.T, r *repository.Repository) (userID int64, sess *model.Ses
 
 // ---- 任务 ----
 
-// fakeAgent 记下被要求取消了哪些任务,可以指定让 CancelTask 报错。
+// fakeAgent 记下派发和取消,可以分别指定让它们报错。
+//
+// startErr 和 err 分开:派发失败要标记任务失败,取消失败只记日志,
+// 两条路径的策略不一样,得能单独触发。
 type fakeAgent struct {
+	started  []agentclient.StartTaskReq
 	canceled []agentclient.CancelTaskReq
-	err      error
+
+	startErr error // StartTask 的返回
+	err      error // CancelTask 的返回
+
+	// onStart 在 StartTask 里同步回调,用来观察"被派发的那一刻"
+	// 数据库是什么样子。TestCreate_DispatchesAfterCommit 靠它。
+	onStart func(agentclient.StartTaskReq)
 }
 
-func (f *fakeAgent) StartTask(context.Context, agentclient.StartTaskReq) error { return nil }
+func (f *fakeAgent) StartTask(_ context.Context, req agentclient.StartTaskReq) error {
+	f.started = append(f.started, req)
+	if f.onStart != nil {
+		f.onStart(req)
+	}
+	return f.startErr
+}
 
 func (f *fakeAgent) CancelTask(_ context.Context, req agentclient.CancelTaskReq) error {
 	f.canceled = append(f.canceled, req)

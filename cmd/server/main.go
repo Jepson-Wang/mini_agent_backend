@@ -78,7 +78,6 @@ func main() {
 
 	repo := repository.New(db)
 	authSvc := service.NewAuthService(repo, tokenMgr)
-	sessionSvc := service.NewSessionService(repo)
 
 	// 下面这三行在拆一个构造环:
 	//
@@ -104,6 +103,9 @@ func main() {
 		}
 	}()
 
+	// SessionService 拿客户端是为了建完任务立刻派发(StartTask),
+	// TaskService 拿它是为了取消时通知(CancelTask)。
+	sessionSvc := service.NewSessionService(repo, agentCli)
 	taskSvc := service.NewTaskService(repo, agentCli)
 
 	// 没配 AGENT_CALLBACK_SECRET 的话 /internal 那组接口一律 500 而不是放行。

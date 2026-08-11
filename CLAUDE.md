@@ -173,6 +173,14 @@ pending ──► running ──┐
 
 `StartTask` 起的消费协程要活过发起它的那次 HTTP 请求，所以 ctx 必须先 `context.WithoutCancel` 再配自己的超时（`AGENT_TASK_TIMEOUT`，默认 30 分钟）。直接从请求 ctx 派生的话，handler 一 return 整条事件流就断了。
 
+### 任务派发
+
+`SessionService` 建完任务立刻调 `dispatch` 把它发给 Agent（`StartTask`）。两个入口都要发：`CreateWithFirstTask` 和 `CreateTaskWithSessionID`。
+
+**`dispatch` 必须在事务提交之后调，不能塞进 `Transaction` 的闭包里。** Agent 是同步的，可能几毫秒内就把 `started` 事件推回来，而那条事件按 `task_uid` 去 UPDATE —— 事务没提交的话那一行对别的连接不可见，UPDATE 匹配不到，`cas` 返回 `false`（在它眼里只是「迟到的回调」，不是错误），任务就永远停在 `pending`。这种 bug 只在 Agent 快、库慢时出现，本地几乎复现不出来。`TestCreate_DispatchesAfterCommit` 盯着它——那条用例**不能**用 `withTx`（要验的正是跨连接可见性，而 `withTx` 的事务永不提交，断言会恒为假），所以它直连 `testDB` 并自己 `t.Cleanup`。
+
+**派发失败就地标 `failed`，不留在 `pending`**：同步 Agent 只有这一次交接机会，交不出去就再没人推动它，留在 `pending` 就是前端一个永远转圈、还没人能解释的任务。写进 `error_msg` 的原因不带 gRPC 原文（里面是内网地址和端口）。派发失败**不让创建失败**——任务确实建出来了。
+
 ### 任务状态是谁写的
 
 **Agent 是同步的**：一次 `RunTask` 调用从头跑到尾，事件流就是任务结果的权威来源。`service.TaskEventHandler` 把事件翻成状态：
