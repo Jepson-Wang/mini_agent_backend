@@ -37,6 +37,45 @@ var (
 // 取消是 best-effort,不值得等太久 —— 库里已经是 canceled 了。
 const cancelTimeout = 10 * time.Second
 
+// keepalive 的三个参数是**跟着服务端默认策略定的**,不是随手挑的间隔。
+// 调小任何一个之前先往下读,不然会直接把连接搞断。
+const (
+	// keepaliveTime 两次 keepalive ping 的间隔。
+	//
+	// 5 分钟是服务端默认允许的**下限**:grpc-go 的
+	// keepalive.EnforcementPolicy.MinTime 和 grpcio(Python)的
+	// grpc.http2.min_ping_interval_without_data_ms 默认都是 5 分钟。
+	// 比它小,服务端攒够两次就回一个
+	//
+	//	GOAWAY / ENHANCE_YOUR_CALM / "too_many_pings"
+	//
+	// 把整条连接踢掉 —— 在途的事件流跟着断,OnStreamError 会把那些
+	// 任务全标成 failed。也就是说这个参数配错了不是"少了点保活",
+	// 是会周期性地误杀正在跑的任务。
+	keepaliveTime = 5 * time.Minute
+
+	// keepaliveTimeout 发出 ping 之后等回应的时间,超时就认为连接死了。
+	keepaliveTimeout = 20 * time.Second
+
+	// keepalivePermitWithoutStream 必须是 false。
+	//
+	// 服务端那边对应的开关(grpc.keepalive_permit_without_calls)默认也是关的:
+	// 没有在途调用还 ping,对面直接当违规计数。而这个客户端大部分时间是空闲的
+	// (任务和任务之间没有流),开着它等于持续给服务端送违规。
+	//
+	// 关掉的代价是空闲连接不再保活,可能被中间的 NAT / LB 静默回收 ——
+	// 不要紧:grpc.NewClient 是懒连接,下次调用会自己重连。
+	keepalivePermitWithoutStream = false
+)
+
+// 想让掉线检测更快(比如 30 秒),**两边都得改**,只改这边必然被踢:
+//
+//	# Python 侧
+//	grpc.server(..., options=[
+//	    ("grpc.keepalive_permit_without_calls", 1),
+//	    ("grpc.http2.min_ping_interval_without_data_ms", 10000),
+//	])
+
 // closeTimeout 关闭时最多等在途的流收多久。
 //
 // 不无限等:一条卡住的流不该让整个进程停不下来。等不及就直接关连接,
@@ -213,9 +252,9 @@ func NewGRPCClient(cfg config.Agent, handler EventHandler) (*GRPCClient, error) 
 			}]
 		}`),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                30 * time.Second,
-			Timeout:             10 * time.Second,
-			PermitWithoutStream: true,
+			Time:                keepaliveTime,
+			Timeout:             keepaliveTimeout,
+			PermitWithoutStream: keepalivePermitWithoutStream,
 		}),
 	)
 	if err != nil {
