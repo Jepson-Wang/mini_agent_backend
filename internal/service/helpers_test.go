@@ -151,6 +151,38 @@ func withTaskSvc(t *testing.T, fn func(t *testing.T, s *TaskService, r *reposito
 	fn(t, NewTaskService(repo, ag), repo, ag)
 }
 
+// ---- 任务事件 ----
+
+// statusCall 是 fakeStatusWriter 记下的一次调用。
+type statusCall struct {
+	taskUID string
+	status  string
+	errMsg  *string
+}
+
+// fakeStatusWriter 是 taskStatusWriter 的假实现,用来验事件到状态的映射 ——
+// 这一层要看的是"哪种事件写哪个状态、写不写",跟数据库没关系。
+// applied 和 err 可以指定,用来模拟"迟到的事件"和"库挂了"。
+type fakeStatusWriter struct {
+	calls   []statusCall
+	applied bool
+	err     error
+}
+
+func newFakeStatusWriter() *fakeStatusWriter {
+	return &fakeStatusWriter{applied: true} // 默认当作改到了行
+}
+
+func (f *fakeStatusWriter) HandleCallback(_ context.Context, taskUID, status string,
+	errMsg *string) (bool, error) {
+
+	f.calls = append(f.calls, statusCall{taskUID: taskUID, status: status, errMsg: errMsg})
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.applied, nil
+}
+
 // seedTask 建一个用户、一个会话和一个 pending 任务,返回用户 id 和 task_uid。
 // 邮箱自动取唯一值,调用方不用操心。
 func seedTask(t *testing.T, r *repository.Repository) (int64, string) {

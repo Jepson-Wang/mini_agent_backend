@@ -33,9 +33,6 @@ func NewInternalHandler(svc TaskCallbackService) *InternalHandler {
 
 // TaskCallback 处理 POST /internal/tasks/:uid/callback。
 //
-// **幂等**:同一条回调重放多少次,结果都一样;而且"没生效"也返回 200,
-// data.applied 里告诉对方改没改到。
-//
 // 为什么不用 404 / 409:回调方是机器,拿到 4xx/5xx 只会按退避策略一直重试,
 // 而"任务已经是终态"(最常见的是用户抢先取消了)重试一万次也不会变。
 // 真正值得重试的只有数据库不可用,那种情况 service 会抛 error,这里回 50000。

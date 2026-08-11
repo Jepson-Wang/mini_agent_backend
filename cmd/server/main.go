@@ -15,6 +15,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"github.com/Jepson-Wang/mini_agent_backend/internal/agentclient"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/config"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/handler"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
@@ -79,9 +80,31 @@ func main() {
 	authSvc := service.NewAuthService(repo, tokenMgr)
 	sessionSvc := service.NewSessionService(repo)
 
-	// Agent 客户端还没实现,先传 nil:取消照样落库,只是通知发不出去,
-	// service 会记一条 Warn。见 service.TaskService.notifyCancel。
-	taskSvc := service.NewTaskService(repo, nil)
+	// 下面这三行在拆一个构造环:
+	//
+	//	TaskService ──要──> agentclient.Client ──要──> EventHandler ──要──> TaskService
+	//
+	// 拆点在于事件处理器只用得上 HandleCallback,而那条路径根本不碰
+	// Agent 客户端(它只读写仓库)。所以先拿一个不带客户端的 TaskService
+	// 把处理器建起来,等客户端有了,再给 HTTP 那侧建一个带客户端的。
+	// 两个 TaskService 都只是仓库之上的无状态包装,不共享任何东西。
+	statusWriter := service.NewTaskService(repo, nil)
+	events := service.NewTaskEventHandler(statusWriter)
+
+	// 懒连接:这里不会真去握手,Agent 没起也能正常启动,
+	// 拨不通要到第一次调用才知道。所以报错只代表参数不对。
+	agentCli, err := agentclient.NewGRPCClient(cfg.Agent, events)
+	if err != nil {
+		fatal("初始化 Agent 客户端失败", err)
+	}
+	defer func() {
+		// 等在途的事件流收完(有上限)再关连接。
+		if err := agentCli.Close(); err != nil {
+			slog.Error("关闭 Agent 客户端失败", "error", err)
+		}
+	}()
+
+	taskSvc := service.NewTaskService(repo, agentCli)
 
 	// 没配 AGENT_CALLBACK_SECRET 的话 /internal 那组接口一律 500 而不是放行。
 	// 提前说一声,免得对面调不通时先去怀疑网络。
@@ -119,6 +142,8 @@ func main() {
 			"debug", debug,
 			"jwt_issuer", cfg.JWT.Issuer,
 			"jwt_access_ttl", cfg.JWT.AccessTTL.String(),
+			"agent_addr", cfg.Agent.Addr,
+			"agent_task_timeout", cfg.Agent.TaskTimeout.String(),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fatal("HTTP 服务异常退出", err)

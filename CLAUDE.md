@@ -161,7 +161,7 @@ pending ──► running ──┐
 
 `AGENT_ADDR`（默认 `localhost:50051`）和 `AGENT_TASK_TIMEOUT`（默认 `30m`）都有默认值，但都会过 `Validate`：空地址、非正的超时一律启动失败。
 
-`agentclient` 包（目录 `internal/agentclient`）是 Agent 那侧 gRPC 服务的客户端，**全仓库唯一允许 import `gen/agent/v1` 的地方，没有例外**（包括 `cmd/grpcprobe`）。
+`agentclient` 包（目录 `internal/agentclient`）是 Agent 那侧 gRPC 服务的客户端，**全仓库唯一允许 import `gen/agent/v1` 的地方，没有例外**。
 
 进出这个包的一律是本地类型：`StartTaskReq` / `CancelTaskReq` / `Event`（含 `EventType` 那组字符串常量和 `IsTerminal`）。proto 类型能走到的最远处是 `toEvent` 和 `CancelTask` 里那次翻译。**别把 wire 类型顶到业务层** —— 对面改一次字段名、加一个枚举值，handler、service 和两边的测试就会一起红，而那本该是实现细节。
 
@@ -169,10 +169,34 @@ pending ──► running ──┐
 
 未知的事件类型翻成 `EventUnknown` 后**照样往下发**（payload 还在），只是多记一条 Warn —— 直接丢弃的话，「对面升级了、我们没跟上」这件事没人会发现。
 
-`agentclient.GRPCClient` 已经实现了 `Client`，但 `main.go` 里传的仍然是 `nil`（还缺一个把事件写回 tasks 表的 `EventHandler`）：取消照常落库，只是通知发不出去，会记一条 Warn。`var _ Client = (*GRPCClient)(nil)` 那行别删 —— 生产代码没有任何一处做这个赋值，少了它接口和实现漂移了编译器不会吭声。
+`var _ Client = (*GRPCClient)(nil)` 那行别删 —— 少了它接口和实现漂移了编译器不会吭声。
 
 `StartTask` 起的消费协程要活过发起它的那次 HTTP 请求，所以 ctx 必须先 `context.WithoutCancel` 再配自己的超时（`AGENT_TASK_TIMEOUT`，默认 30 分钟）。直接从请求 ctx 派生的话，handler 一 return 整条事件流就断了。
 
-`cmd/grpcprobe` 是连通性探针：`AGENT_ADDR=host:port go run ./cmd/grpcprobe`。它走的是和生产同一条路径（`StartTask` + `EventHandler`），不绕过 `Client` 接口 —— 探针通了才说明业务那条路也通。
+### 任务状态是谁写的
+
+**Agent 是同步的**：一次 `RunTask` 调用从头跑到尾，事件流就是任务结果的权威来源。`service.TaskEventHandler` 把事件翻成状态：
+
+| 事件 | 动作 |
+|---|---|
+| `started` | → `running` |
+| `finished` | → `succeeded` |
+| `error` | → `failed`，payload 当失败原因 |
+| `thinking` / `tool_call` / `tool_result` / `unknown` | 只记日志，**不写库**（是进度不是状态） |
+| 流中断（`OnStreamError`） | → `failed` |
+
+**流断了必须给任务收尾**，不然它永远停在 `running`。这不会误伤已完成的任务：事件在同一个协程里按序处理，走到 `OnStreamError` 时 `finished` 要么早处理完了（`cas` 落空），要么根本没来过。
+
+所有状态写入都过 `TaskService.HandleCallback`，**别绕开它直接调仓库层** —— `canceled` 白名单、`cas`、迟到回调的日志三件事都在那儿。事件里的失败原因要用 `truncate` 截到 `maxEventErrMsg`（和 `dto.TaskCallbackReq` 的 `max=2000` 对齐）：gRPC 这条路没有 binding tag 挡着，`tasks.error_msg` 又是 text，不截的话对面一条事件就能塞几 MB 进来，而且会跟着任务详情回显给用户。同理，流中断写进 `error_msg` 的文案不能带 gRPC 原文（里面有内网地址和端口）。
+
+`/internal` 回调**保留但同步 Agent 用不上**，Python 侧不必实现它。两条路都过 `cas`，不会打架。
+
+### main.go 的构造环
+
+```
+TaskService ──要──> agentclient.Client ──要──> EventHandler ──要──> TaskService
+```
+
+拆点是「事件处理器只用 `HandleCallback`，而那条路径根本不碰 Agent 客户端」：先拿一个不带客户端的 `TaskService` 把处理器建起来，客户端有了之后再给 HTTP 那侧建一个带客户端的。两个都只是仓库之上的无状态包装，不共享东西。别改成 setter —— 那会让「客户端什么时候可用」变成运行时才知道的事。
 
 已知未做：登录没有限流（`handler/auth.go` 有 TODO，bcrypt 的耗时拦不住撞库）；JWT 没有吊销机制（`jti` 已签进去，是将来做黑名单的钩子）；`Login` 里"用户不存在"分支比"口令错"少跑一次 bcrypt，存在约 160ms 的时间侧信道（代码注释里写明了）；`/internal` 目前和业务接口共用一个监听端口，生产上应该单独端口或由网关按前缀挡在公网外。

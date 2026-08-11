@@ -1,0 +1,144 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/Jepson-Wang/mini_agent_backend/internal/agentclient"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/trace"
+)
+
+// maxEventErrMsg 从事件里取失败原因时的截断长度。
+//
+// 必须截:这个值会原样落进 tasks.error_msg,而那是一列 text,
+// 数据库自己不设上限,而且它还会跟着任务详情接口发回给用户。
+// HTTP 回调那条路由 dto.TaskCallbackReq 的 max=2000 挡着,
+// gRPC 这条路没有 binding tag,只能在这儿挡。两边数字保持一致。
+const maxEventErrMsg = 2000
+
+// taskStatusWriter 是事件处理器需要的能力,生产实现是 *TaskService。
+//
+// 定成接口是为了打破一个构造环:TaskService 要 agentclient.Client,
+// 客户端要 EventHandler,而 EventHandler 又要回头调 TaskService。
+// 见 cmd/server/main.go 里的接线注释。
+type taskStatusWriter interface {
+	HandleCallback(ctx context.Context, taskUID, status string, errMsg *string) (bool, error)
+}
+
+// TaskEventHandler 把 Agent 推上来的事件流翻成任务状态。
+//
+// 它实现 agentclient.EventHandler。所有状态写入都过 HandleCallback,
+// 不直接碰仓库层 —— 那里面有三件不能绕开的事:canceled 不许由 Agent 写、
+// cas 保证终态不被翻回去、没生效的回调要留日志。
+//
+// 这是**同步 Agent** 下的接线:一次 RunTask 调用从头跑到尾,
+// 事件流就是任务结果的权威来源。流断了就没有第二个人会来报结果了,
+// 所以 OnStreamError 必须给任务收尾,否则它会永远停在 running。
+type TaskEventHandler struct {
+	tasks taskStatusWriter
+}
+
+func NewTaskEventHandler(tasks taskStatusWriter) *TaskEventHandler {
+	return &TaskEventHandler{tasks: tasks}
+}
+
+// eventStatus 是「会改变任务状态的事件」到目标状态的映射。
+//
+// 不在这张表里的事件(thinking / tool_call / tool_result / unknown)
+// 是进度,不是状态:它们只记日志,不写库。
+//
+// 注意这里没有任何一项映射到 model.TaskCanceled ——
+// 取消只能由用户发起,HandleCallback 那边还会再挡一次。
+var eventStatus = map[agentclient.EventType]string{
+	agentclient.EventStarted:  model.TaskRunning,
+	agentclient.EventFinished: model.TaskSucceeded,
+	agentclient.EventError:    model.TaskFailed,
+}
+
+// OnEvent 消费一条事件。
+//
+// 返回错误只会被 agentclient 记一条日志,流不会中断 ——
+// 一条事件写库失败不该让后面的事件(尤其是 finished)全都收不到。
+func (h *TaskEventHandler) OnEvent(ctx context.Context, ev agentclient.Event) error {
+	traceID := trace.FromContext(ctx)
+
+	status, ok := eventStatus[ev.Type]
+	if !ok {
+		// 进度事件。将来要把 payload 落进消息表的话,入口就在这儿。
+		slog.Info("任务进度",
+			"task_uid", ev.TaskUID, "seq", ev.Seq,
+			"type", string(ev.Type), "trace_id", traceID)
+		return nil
+	}
+
+	// 只有 failed 才带原因 —— 成功的任务不该留着上一次的错误信息。
+	var errMsg *string
+	if status == model.TaskFailed {
+		errMsg = truncate(ev.Payload, maxEventErrMsg)
+	}
+
+	applied, err := h.tasks.HandleCallback(ctx, ev.TaskUID, status, errMsg)
+	if err != nil {
+		return fmt.Errorf("事件 %s(seq=%d)写库失败: %w", ev.Type, ev.Seq, err)
+	}
+	if !applied {
+		// 不是错误:最常见的是用户抢先取消了,任务已经是终态。
+		// HandleCallback 里已经打过一条更详细的日志,这里不重复。
+		return nil
+	}
+
+	slog.Info("任务状态已更新",
+		"task_uid", ev.TaskUID, "status", status,
+		"seq", ev.Seq, "trace_id", traceID)
+	return nil
+}
+
+// OnStreamError 流异常结束。正常结束(EOF)不会走到这里。
+//
+// 把任务标成 failed 是刻意的:同步 Agent 只有事件流这一条汇报通道,
+// 流断了就再没有人会来报结果,不收尾的话任务会永远停在 running,
+// 用户界面上转圈转到天荒地老。
+//
+// 这不会覆盖掉已经跑完的任务:事件是在同一个协程里按序处理的,
+// 走到这里说明 finished 要么早就处理完了(那时状态已是终态,
+// 这次 cas 落空),要么根本没来过。
+func (h *TaskEventHandler) OnStreamError(ctx context.Context, taskUID string, err error) {
+	traceID := trace.FromContext(ctx)
+
+	slog.Error("与 Agent 的事件流中断,将任务标记为失败",
+		"task_uid", taskUID, "trace_id", traceID, "error", err)
+
+	// 给用户看的原因只说"连接中断",不带 err 原文 —— 那里面有
+	// 地址、端口、gRPC 内部细节,而 error_msg 是会回显给用户的。
+	msg := truncate("与执行器的连接中断", maxEventErrMsg)
+
+	applied, err := h.tasks.HandleCallback(ctx, taskUID, model.TaskFailed, msg)
+	if err != nil {
+		// 这里没有上层可以返回了,只能记下来。
+		slog.Error("流中断后给任务收尾也失败了",
+			"task_uid", taskUID, "trace_id", traceID, "error", err)
+		return
+	}
+	if !applied {
+		slog.Info("流中断时任务已是终态,不用收尾",
+			"task_uid", taskUID, "trace_id", traceID)
+	}
+}
+
+// truncate 去掉首尾空白并按**字符数**截断,空的返回 nil(对应库里的 NULL)。
+//
+// 按 []rune 而不是 []byte 切:按字节切会把一个汉字劈成两半,
+// 落库就是一段乱码。
+func truncate(s string, max int) *string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	if r := []rune(s); len(r) > max {
+		s = string(r[:max])
+	}
+	return &s
+}
