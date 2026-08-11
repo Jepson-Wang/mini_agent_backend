@@ -26,7 +26,7 @@ func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
 		"CONFIG_PATH", "ENV_PATH", "APP_ENV", "HTTP_ADDR", "DB_DSN",
-		"AGENT_ADDR", "AGENT_CALLBACK_SECRET",
+		"AGENT_ADDR", "AGENT_CALLBACK_SECRET", "AGENT_TASK_TIMEOUT",
 		"JWT_ISSUER", "JWT_SECRET", "JWT_ACCESS_TTL",
 	} {
 		// 两步走。t.Setenv 是为了登记 cleanup,测试结束把原值还回去;

@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
-	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
-	"github.com/Jepson-Wang/mini_agent_backend/internal/agent"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/agentclient"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/trace"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
@@ -47,8 +47,10 @@ func (s *TaskService) GetTaskDetailByTaskID(ctx context.Context, userID int64,
 // 于是我们紧接着把一个已经跑完的任务盖成 canceled,用户看到的状态是错的。
 // 先写 canceled 则相反:迟到的回调撞上 CAS 的 from=[pending,running],
 // 自然落空,不用额外加锁。
-func (s *TaskService) Cancel(ctx context.Context, userID int64, request *agentv1.CancelTaskRequest) (*model.Task, error) {
-	taskUID := request.TaskUid
+// reason 是用户填的取消理由,空串表示没填,落库存 NULL。
+func (s *TaskService) Cancel(ctx context.Context, userID int64,
+	taskUID, reason string) (*model.Task, error) {
+
 	t, err := s.mustOwn(ctx, userID, taskUID)
 	if err != nil {
 		return nil, err
@@ -60,7 +62,7 @@ func (s *TaskService) Cancel(ctx context.Context, userID int64, request *agentv1
 		return nil, fmt.Errorf("%w: status=%s", model.ErrTaskNotCancelable, t.Status)
 	}
 
-	ok, err := s.repo.Task.MarkCanceled(ctx, taskUID)
+	ok, err := s.repo.Task.MarkCanceled(ctx, taskUID, normalizeReason(reason))
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +72,7 @@ func (s *TaskService) Cancel(ctx context.Context, userID int64, request *agentv1
 		return nil, fmt.Errorf("%w: 状态已被并发改写", model.ErrTaskNotCancelable)
 	}
 
-	s.notifyCancel(ctx, request)
+	s.notifyCancel(ctx, taskUID, reason)
 
 	// 重新查一次。上面那份 t 是 UPDATE 之前读的,status / finished_at
 	// / updated_at 都已经过期,直接返回它等于骗客户端。
@@ -82,9 +84,8 @@ func (s *TaskService) Cancel(ctx context.Context, userID int64, request *agentv1
 // 库里已经是 canceled,那才是权威状态;通知不到顶多让 Agent 白跑一会儿,
 // 它回来的结果会被 CAS 丢掉。为了一次通知失败就把用户的取消判为失败,
 // 会让用户重试 —— 而重试同样会失败,因为任务已经是终态了。
-func (s *TaskService) notifyCancel(ctx context.Context, request *agentv1.CancelTaskRequest) {
+func (s *TaskService) notifyCancel(ctx context.Context, taskUID, reason string) {
 	traceID := trace.FromContext(ctx)
-	taskUID := request.TaskUid
 
 	if s.agent == nil {
 		slog.Warn("未注入 Agent 客户端,取消只落了库",
@@ -98,7 +99,10 @@ func (s *TaskService) notifyCancel(ctx context.Context, request *agentv1.CancelT
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), notifyTimeout)
 	defer cancel()
 
-	if err := s.agent.CancelTask(ctx, request); err != nil {
+	// trace_id 从 ctx 取,不从入参传 —— 让 handler 显式往下递一个 trace id,
+	// 等于同一个值有两条管道,迟早会有一条忘了接。
+	req := agentclient.CancelTaskReq{TaskUID: taskUID, Reason: reason, TraceID: traceID}
+	if err := s.agent.CancelTask(ctx, req); err != nil {
 		slog.Warn("通知 Agent 取消任务失败",
 			"task_uid", taskUID, "trace_id", traceID, "error", err)
 	}
@@ -169,6 +173,16 @@ func (s *TaskService) logIgnoredCallback(ctx context.Context, taskUID, status st
 			"task_uid", taskUID, "status", status,
 			"current_status", t.Status, "trace_id", traceID)
 	}
+}
+
+// normalizeReason 去空白;空的返回 nil,对应库里的 NULL。
+// 和 normalizeNickname 同一个理由:别让库里同时存在 NULL 和 "" 两种"没填"。
+func normalizeReason(reason string) *string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return nil
+	}
+	return &reason
 }
 
 // mustOwn 取出任务并确认它属于 userID。

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"testing"
 
-	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
 )
@@ -19,7 +18,7 @@ func TestCancel_MarksCanceled(t *testing.T) {
 		ctx := context.Background()
 		userID, uid := seedTask(t, r)
 
-		got, err := s.Cancel(ctx, userID, &agentv1.CancelTaskRequest{TaskUid: uid})
+		got, err := s.Cancel(ctx, userID, uid, "")
 		if err != nil {
 			t.Fatalf("Cancel: %v", err)
 		}
@@ -31,8 +30,51 @@ func TestCancel_MarksCanceled(t *testing.T) {
 		if got.FinishedAt == nil {
 			t.Error("FinishedAt 是 nil,说明返回的是 UPDATE 之前的那份数据")
 		}
-		if len(ag.canceled) != 1 || ag.canceled[0] != uid {
-			t.Errorf("应当通知 Agent 取消 %q,实际 %v", uid, ag.canceled)
+		if got := ag.canceledUIDs(); len(got) != 1 || got[0] != uid {
+			t.Errorf("应当通知 Agent 取消 %q,实际 %v", uid, got)
+		}
+	})
+}
+
+// 取消理由要落库,而且要原样带给 Agent。
+//
+// 只发给 Agent 不落库的话,Agent 没接上(生产现在就是 nil)时
+// 用户填的理由直接蒸发,事后谁也说不清这单为什么被取消了。
+func TestCancel_ReasonIsStoredAndForwarded(t *testing.T) {
+	withTaskSvc(t, func(t *testing.T, s *TaskService, r *repository.Repository, ag *fakeAgent) {
+		ctx := context.Background()
+		userID, uid := seedTask(t, r)
+		const reason = "点错了"
+
+		got, err := s.Cancel(ctx, userID, uid, reason)
+		if err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+		if got.CancelReason == nil || *got.CancelReason != reason {
+			t.Errorf("CancelReason = %v, 期望 %q", got.CancelReason, reason)
+		}
+		if len(ag.canceled) != 1 {
+			t.Fatalf("通知了 Agent %d 次", len(ag.canceled))
+		}
+		if ag.canceled[0].Reason != reason {
+			t.Errorf("发给 Agent 的 Reason = %q, 期望 %q", ag.canceled[0].Reason, reason)
+		}
+	})
+}
+
+// 没填理由要存 NULL,不是空串 —— 否则库里会有两种"没填",
+// 和 normalizeNickname 是同一条规矩。
+func TestCancel_BlankReasonIsNull(t *testing.T) {
+	withTaskSvc(t, func(t *testing.T, s *TaskService, r *repository.Repository, _ *fakeAgent) {
+		got, err := func() (*model.Task, error) {
+			userID, uid := seedTask(t, r)
+			return s.Cancel(context.Background(), userID, uid, "   ")
+		}()
+		if err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+		if got.CancelReason != nil {
+			t.Errorf("CancelReason = %q, 期望 NULL", *got.CancelReason)
 		}
 	})
 }
@@ -44,7 +86,7 @@ func TestCancel_LateCallbackCannotRevive(t *testing.T) {
 		ctx := context.Background()
 		userID, uid := seedTask(t, r)
 
-		if _, err := s.Cancel(ctx, userID, &agentv1.CancelTaskRequest{TaskUid: uid}); err != nil {
+		if _, err := s.Cancel(ctx, userID, uid, ""); err != nil {
 			t.Fatalf("Cancel: %v", err)
 		}
 
@@ -74,8 +116,8 @@ func TestCancel_OtherUsersTaskLooksMissing(t *testing.T) {
 		_, uid := seedTask(t, r)
 		intruderID, _ := seedTask(t, r)
 
-		_, errMine := s.Cancel(ctx, intruderID, &agentv1.CancelTaskRequest{TaskUid: uid})
-		_, errGone := s.Cancel(ctx, intruderID, &agentv1.CancelTaskRequest{TaskUid: "01J8ZQXK7PZZZZZZZZZZZZZZZZ"})
+		_, errMine := s.Cancel(ctx, intruderID, uid, "")
+		_, errGone := s.Cancel(ctx, intruderID, "01J8ZQXK7PZZZZZZZZZZZZZZZZ", "")
 
 		if !errors.Is(errMine, model.ErrTaskNotFound) {
 			t.Errorf("取消别人的任务 = %v, 期望 ErrTaskNotFound", errMine)
@@ -93,7 +135,7 @@ func TestCancel_OtherUsersTaskLooksMissing(t *testing.T) {
 			t.Errorf("Status = %q, 别人的取消不该改动它", after.Status)
 		}
 		if len(ag.canceled) != 0 {
-			t.Errorf("不该通知 Agent,实际 %v", ag.canceled)
+			t.Errorf("不该通知 Agent,实际 %v", ag.canceledUIDs())
 		}
 	})
 }
@@ -107,7 +149,7 @@ func TestCancel_AlreadyTerminal(t *testing.T) {
 			t.Fatalf("MarkSucceeded: %v", err)
 		}
 
-		_, err := s.Cancel(ctx, userID, &agentv1.CancelTaskRequest{TaskUid: uid})
+		_, err := s.Cancel(ctx, userID, uid, "")
 		if !errors.Is(err, model.ErrTaskNotCancelable) {
 			t.Fatalf("Cancel = %v, 期望 ErrTaskNotCancelable", err)
 		}
@@ -122,7 +164,7 @@ func TestCancel_AgentFailureDoesNotFailTheRequest(t *testing.T) {
 		ag.err = errors.New("connection refused")
 		userID, uid := seedTask(t, r)
 
-		got, err := s.Cancel(ctx, userID, &agentv1.CancelTaskRequest{TaskUid: uid})
+		got, err := s.Cancel(ctx, userID, uid, "")
 		if err != nil {
 			t.Fatalf("Agent 挂了不该让取消失败: %v", err)
 		}
@@ -139,7 +181,7 @@ func TestCancel_NilAgent(t *testing.T) {
 	s := NewTaskService(r, nil)
 	userID, uid := seedTask(t, r)
 
-	if _, err := s.Cancel(context.Background(), userID, &agentv1.CancelTaskRequest{TaskUid: uid}); err != nil {
+	if _, err := s.Cancel(context.Background(), userID, uid, ""); err != nil {
 		t.Fatalf("未注入 Agent 不该让取消失败: %v", err)
 	}
 }

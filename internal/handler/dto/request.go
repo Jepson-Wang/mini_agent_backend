@@ -60,9 +60,15 @@ type CreateSessionReq struct {
 	Input *string `json:"input" binding:"omitempty,max=8000"`
 }
 
-// CancelTaskReasonReq
+// CancelTaskReasonReq 是取消任务时可选的理由。
+//
+// 整个 body 都是可选的:不带 body 就是"我就是想取消"(见 TaskHandler.Cancel)。
+// 所以 Reason 上没有 required —— 空串等于没填,service 会存成 NULL。
+//
+// max 和 model.Task.CancelReason 的 varchar(200) 对齐:限长必须在入口做,
+// 否则一条超长的理由要到 INSERT 才炸,对外是 50000 而不是 40000。
 type CancelTaskReasonReq struct {
-	Reason string `json:"reason" binding:"max=20"`
+	Reason string `json:"reason" binding:"max=200"`
 }
 
 // UpdateSessionTitleReq 改标题。

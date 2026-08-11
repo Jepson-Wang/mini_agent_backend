@@ -14,7 +14,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/handler"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ptr"
@@ -42,6 +41,7 @@ type fakeTask struct {
 
 	gotUserID  int64
 	gotUID     string
+	gotReason  string
 	gotStatus  string
 	gotErrMsg  *string
 	cancelCall int
@@ -52,9 +52,9 @@ func (f *fakeTask) GetTaskDetailByTaskID(_ context.Context, userID int64, taskUI
 	return f.task, f.err
 }
 
-func (f *fakeTask) Cancel(_ context.Context, userID int64, req *agentv1.CancelTaskRequest) (*model.Task, error) {
+func (f *fakeTask) Cancel(_ context.Context, userID int64, taskUID, reason string) (*model.Task, error) {
 	f.cancelCall++
-	f.gotUserID, f.gotUID = userID, req.TaskUid
+	f.gotUserID, f.gotUID, f.gotReason = userID, taskUID, reason
 	return f.task, f.err
 }
 
@@ -125,6 +125,52 @@ func TestCancel_OK(t *testing.T) {
 	// 用户身份必须来自令牌,不能来自请求体或路径。
 	if svc.gotUserID != 7 {
 		t.Errorf("service 收到的 userID = %d, 期望来自令牌的 7", svc.gotUserID)
+	}
+}
+
+// body 是可选的。不带 body 的取消必须照常成功 ——
+// ShouldBindJSON 碰上空 body 报 io.EOF,不挡一下会把一次正常的取消变成 40000。
+func TestCancel_BodyIsOptional(t *testing.T) {
+	svc := &fakeTask{task: sampleTask()}
+	w := authed(taskRouter(svc), "/api/v1/tasks/"+sampleUID+"/cancel")
+
+	if got := decode(t, w); got.Code != response.CodeOK {
+		t.Fatalf("不带 body 的取消 code = %d, body=%s", got.Code, w.Body.String())
+	}
+	if svc.cancelCall != 1 {
+		t.Errorf("service 被调了 %d 次,期望 1", svc.cancelCall)
+	}
+	if svc.gotReason != "" {
+		t.Errorf("没填理由时 reason 应当是空串,实际 %q", svc.gotReason)
+	}
+}
+
+// 填了理由就得原样交给 service。
+func TestCancel_ReasonReachesService(t *testing.T) {
+	svc := &fakeTask{task: sampleTask()}
+	w := do(taskRouter(svc), "/api/v1/tasks/"+sampleUID+"/cancel",
+		`{"reason":"点错了"}`, map[string]string{"Authorization": "Bearer whatever"})
+
+	if got := decode(t, w); got.Code != response.CodeOK {
+		t.Fatalf("code = %d, body=%s", got.Code, w.Body.String())
+	}
+	if svc.gotReason != "点错了" {
+		t.Errorf("service 收到的 reason = %q", svc.gotReason)
+	}
+}
+
+// 超长的理由必须在入口就被挡下,不能带到 service 去撞 varchar(200)。
+func TestCancel_RejectsOversizedReason(t *testing.T) {
+	svc := &fakeTask{task: sampleTask()}
+	body := `{"reason":"` + strings.Repeat("啊", 201) + `"}`
+	w := do(taskRouter(svc), "/api/v1/tasks/"+sampleUID+"/cancel",
+		body, map[string]string{"Authorization": "Bearer whatever"})
+
+	if got := decode(t, w); got.Code != response.CodeInvalidParam {
+		t.Fatalf("code = %d, 期望 %d", got.Code, response.CodeInvalidParam)
+	}
+	if svc.cancelCall != 0 {
+		t.Errorf("超长的理由不该走到 service,实际调了 %d 次", svc.cancelCall)
 	}
 }
 

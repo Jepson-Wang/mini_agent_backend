@@ -3,8 +3,6 @@ package handler
 import (
 	"context"
 
-	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
-	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/trace"
 	"github.com/gin-gonic/gin"
 
 	"github.com/Jepson-Wang/mini_agent_backend/internal/handler/dto"
@@ -18,9 +16,12 @@ import (
 // 接口定在使用方这一侧,不在 service 包里 —— 这样 handler 的测试
 // 塞一个假的就能跑完整条 router 链路,不连数据库。
 // 生产实现是 *service.TaskService。
+// 参数都是普通类型,不出现 gen/agent/v1 里的 protobuf message ——
+// 让 HTTP 层去拼一个 gRPC 的 wire 结构,等于 Agent 的 proto 一改
+// handler 和它的测试都得跟着重写。拼 message 是 agentclient 的活。
 type TaskService interface {
 	GetTaskDetailByTaskID(ctx context.Context, userID int64, taskUID string) (*model.Task, error)
-	Cancel(ctx context.Context, userID int64, request *agentv1.CancelTaskRequest) (*model.Task, error)
+	Cancel(ctx context.Context, userID int64, taskUID, reason string) (*model.Task, error)
 }
 
 // TaskHandler 处理用户对任务的操作。挂在私有路由组上,必须有登录态。
@@ -90,19 +91,13 @@ func (h *TaskHandler) Cancel(c *gin.Context) {
 		return
 	}
 
-	// trace_id 由 TraceID 中间件种在最外层,取不到也只是链路断一截,
-	// 不该因此拒掉一次取消 —— 库里的状态才是要紧的那个。
-	traceID := trace.FromGin(c)
-
+	// trace_id 不用在这里往下传:它已经在 ctx 里了(TraceID 中间件种的),
+	// service 通知 Agent 时自己 trace.FromContext 取。
+	//
 	// MustUserID 取不到会 panic,那说明这条路由忘了挂 Auth ——
 	// 是接线 bug,早点炸出来好过默默拿 0 当用户 id 去查别人的数据。
 	// Recovery 会兜住,对外是 50000。
-	t, err := h.svc.Cancel(c.Request.Context(), middleware.MustUserID(c),
-		&agentv1.CancelTaskRequest{
-			TaskUid: uid,
-			Reason:  req.Reason,
-			TraceId: traceID,
-		})
+	t, err := h.svc.Cancel(c.Request.Context(), middleware.MustUserID(c), uid, req.Reason)
 	if err != nil {
 		response.FailFromError(c, err)
 		return

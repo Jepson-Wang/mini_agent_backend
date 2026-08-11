@@ -12,8 +12,7 @@ import (
 	"testing"
 	"time"
 
-	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
-	"github.com/Jepson-Wang/mini_agent_backend/internal/agent"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/agentclient"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ptr"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
@@ -123,15 +122,24 @@ func seed(t *testing.T, r *repository.Repository) (userID int64, sess *model.Ses
 
 // fakeAgent 记下被要求取消了哪些任务,可以指定让 CancelTask 报错。
 type fakeAgent struct {
-	canceled []string
+	canceled []agentclient.CancelTaskReq
 	err      error
 }
 
 func (f *fakeAgent) StartTask(context.Context, agentclient.StartTaskReq) error { return nil }
 
-func (f *fakeAgent) CancelTask(_ context.Context, request *agentv1.CancelTaskRequest) error {
-	f.canceled = append(f.canceled, request.TaskUid)
+func (f *fakeAgent) CancelTask(_ context.Context, req agentclient.CancelTaskReq) error {
+	f.canceled = append(f.canceled, req)
 	return f.err
+}
+
+// canceledUIDs 只要 task_uid,大多数用例关心的就是这个。
+func (f *fakeAgent) canceledUIDs() []string {
+	uids := make([]string, 0, len(f.canceled))
+	for _, r := range f.canceled {
+		uids = append(uids, r.TaskUID)
+	}
+	return uids
 }
 
 // withTaskSvc 在独立事务里跑一个 TaskService 用例,Agent 是假的。
