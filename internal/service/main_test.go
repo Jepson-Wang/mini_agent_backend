@@ -7,7 +7,7 @@
 package service
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"testing"
 
@@ -40,7 +40,7 @@ func TestMain(m *testing.M) {
 	// 注意这是**进程级**副作用,所有用例共享。想临时改 cost 的用例
 	// (见 TestLogin_RehashesWhenCostIncreases)必须自己 t.Cleanup 恢复。
 	if err := hash.SetCost(bcrypt.MinCost); err != nil {
-		log.Fatalf("SetCost: %v", err)
+		fatal("SetCost 失败", err)
 	}
 
 	if dsn := os.Getenv("TEST_DSN"); dsn != "" {
@@ -50,12 +50,43 @@ func TestMain(m *testing.M) {
 			TranslateError: true,
 		})
 		if err != nil {
-			log.Fatalf("连接测试库失败: %v", err)
+			fatal("连接测试库失败", err)
 		}
-		if err := db.AutoMigrate(&model.User{}, &model.Session{}, &model.Task{}); err != nil {
-			log.Fatalf("测试库迁移失败: %v", err)
+		if err := migrateTestDB(db); err != nil {
+			fatal("测试库迁移失败", err)
 		}
 		testDB = db
 	}
 	os.Exit(m.Run())
+}
+
+// fatal 打一条 ERROR 然后退出。
+//
+// TestMain 里没有 *testing.T,t.Fatalf 用不了;而这几处失败都发生在
+// m.Run() 之前,一条用例都还没跑起来,只能直接退。
+func fatal(msg string, err error) {
+	slog.Error(msg, "error", err)
+	os.Exit(1)
+}
+
+// migrateTestDB 在一把 advisory 锁里跑 AutoMigrate。
+//
+// 本包和 repository 包的 TestMain 各跑一次迁移,而 go test ./... 是并行跑包的。
+// 平时两边都是空操作看不出问题,一旦有新列(比如 tasks.cancel_reason),
+// 两条 ALTER TABLE ... ADD COLUMN 撞在一起就会有一个拿到
+// 42701(column already exists),整个包直接 log.Fatal ——
+// 表现是"第一次跑挂,第二次就好了",很容易被当成偶发放过去。
+//
+// 用 pg_advisory_xact_lock 而不是 pg_advisory_lock:后者是会话级的,
+// 连接被还回池里之后锁还在,得自己配对解锁;前者在事务结束时自动释放。
+// 锁常量必须和 repository 那边的一致。
+func migrateTestDB(db *gorm.DB) error {
+	const migrateLockKey = 0x6D696E69 // "mini"
+
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", migrateLockKey).Error; err != nil {
+			return err
+		}
+		return tx.AutoMigrate(&model.User{}, &model.Session{}, &model.Task{})
+	})
 }
