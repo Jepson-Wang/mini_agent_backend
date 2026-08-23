@@ -108,6 +108,27 @@ func main() {
 	sessionSvc := service.NewSessionService(repo, agentCli)
 	taskSvc := service.NewTaskService(repo, agentCli)
 
+	// 任务回收器:把没人再会来报结果的任务收尾。
+	//
+	// 它是同步 Agent 那条链路的兜底 —— 进程重启、Pod 被驱逐、流被掐断时,
+	// OnStreamError 根本没机会跑,任务会永远停在 pending / running。
+	//
+	// 用独立的 ctx 而不是请求 ctx:它要活到进程退出为止。
+	reconcileCtx, stopReconcile := context.WithCancel(context.Background())
+	defer stopReconcile()
+
+	// 用 statusWriter(不带 Agent 客户端的那个)就够了:回收器只写状态,
+	// 从不联系 Agent —— 一个连不上的 Agent 正是它要处理的情况。
+	reconciler, err := service.NewReconciler(repo.Task, statusWriter, cfg.Reconcile)
+	if err != nil {
+		fatal("初始化任务回收器失败", err)
+	}
+	if reconciler == nil {
+		slog.Warn("未启用任务回收器(reconcile.interval <= 0),卡住的任务不会被自动收尾")
+	} else {
+		go reconciler.Run(reconcileCtx)
+	}
+
 	// 没配 AGENT_CALLBACK_SECRET 的话 /internal 那组接口一律 500 而不是放行。
 	// 提前说一声,免得对面调不通时先去怀疑网络。
 	if cfg.Agent.CallbackSecret == "" {
@@ -121,7 +142,9 @@ func main() {
 	}
 
 	router := handler.NewRouter(handler.Deps{
-		DB:            db,
+		DB: db,
+		// /health 拿它探 Agent。探不通只降级成 degraded,不 500。
+		Agent:         agentCli,
 		Auth:          authSvc,
 		Session:       sessionSvc,
 		Task:          taskSvc,
@@ -146,6 +169,10 @@ func main() {
 			"jwt_access_ttl", cfg.JWT.AccessTTL.String(),
 			"agent_addr", cfg.Agent.Addr,
 			"agent_task_timeout", cfg.Agent.TaskTimeout.String(),
+			"agent_breaker_threshold", cfg.Agent.BreakerThreshold,
+			"agent_breaker_cooldown", cfg.Agent.BreakerCooldown.String(),
+			"reconcile_interval", cfg.Reconcile.Interval.String(),
+			"reconcile_stale_after", cfg.Reconcile.StaleAfter.String(),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fatal("HTTP 服务异常退出", err)
@@ -157,6 +184,10 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	slog.Info("收到退出信号,开始优雅关闭")
+
+	// 先停回收器再关 HTTP:它是纯后台循环,没有在途请求要照顾,
+	// 而让它在关闭过程中又扫一轮、又去写库,只会拖长关闭时间。
+	stopReconcile()
 
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
