@@ -23,6 +23,7 @@ import (
 
 	agentv1 "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/config"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/breaker"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
@@ -36,6 +37,13 @@ var (
 // cancelTimeout 通知 Agent 取消时等它的时间。
 // 取消是 best-effort,不值得等太久 —— 库里已经是 canceled 了。
 const cancelTimeout = 10 * time.Second
+
+// healthTimeout 探活等回应的时间。
+//
+// 必须很短:调用方是 /health,而 /health 自己是被 k8s 探针、负载均衡器
+// 按秒轮询的。这里等 10 秒的话,Agent 一挂,每个探针请求都占住一个
+// HTTP 处理协程 10 秒 —— 探活反倒成了压垮自己的那根稻草。
+const healthTimeout = 2 * time.Second
 
 // keepalive 的三个参数是**跟着服务端默认策略定的**,不是随手挑的间隔。
 // 调小任何一个之前先往下读,不然会直接把连接搞断。
@@ -89,6 +97,27 @@ const closeTimeout = 5 * time.Second
 type Client interface {
 	StartTask(ctx context.Context, req StartTaskReq) error
 	CancelTask(ctx context.Context, req CancelTaskReq) error
+
+	// Health 探一次 Agent 活着没有。给 /health 用。
+	//
+	// 返回 error 表示"问不到"(连不上、超时);返回 (HealthStatus{OK:false}, nil)
+	// 表示"问到了,它说自己不好"。这两种要分开 —— 前者是网络/进程层面的事,
+	// 后者是 Agent 自己的自检结论(比如模型后端连不上),排查方向完全不同。
+	Health(ctx context.Context) (HealthStatus, error)
+
+	// BreakerState 返回熔断器当前状态(closed / open / half_open),
+	// 只读,不推进状态机。给 /health 展示用。
+	BreakerState() string
+}
+
+// HealthStatus 是一次探活的结果。
+type HealthStatus struct {
+	// OK 是 Agent 自己的自检结论。
+	OK bool
+
+	// Version 是 Agent 报的版本号,可能是空串。
+	// 有它才能在两边行为对不上时,一眼看出是不是版本没对齐。
+	Version string
 }
 
 // 编译期钉住:GRPCClient 必须满足 Client。
@@ -213,6 +242,7 @@ type GRPCClient struct {
 	cli         agentv1.AgentServiceClient
 	handler     EventHandler
 	taskTimeout time.Duration
+	breaker     *breaker.Breaker
 	wg          sync.WaitGroup
 	closing     atomic.Bool
 }
@@ -234,6 +264,17 @@ func NewGRPCClient(cfg config.Agent, handler EventHandler) (*GRPCClient, error) 
 	taskTimeout := cfg.TaskTimeout
 	if taskTimeout <= 0 {
 		taskTimeout = config.DefaultAgentTaskTimeout
+	}
+
+	// HalfOpenMax 固定 1,不做成配置项:半开期放出去的每一个请求
+	// 都可能打在一个还没缓过来的 Agent 上,而这里一个"请求"就是一整个任务。
+	br, err := breaker.New(breaker.Config{
+		FailureThreshold: cfg.BreakerThreshold,
+		Cooldown:         cfg.BreakerCooldown,
+		HalfOpenMax:      1,
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	conn, err := grpc.NewClient(cfg.Addr,
@@ -265,15 +306,31 @@ func NewGRPCClient(cfg config.Agent, handler EventHandler) (*GRPCClient, error) 
 		cli:         agentv1.NewAgentServiceClient(conn),
 		handler:     handler,
 		taskTimeout: taskTimeout,
+		breaker:     br,
 	}, nil
 }
 
 // StartTask 让 Agent 开跑,然后在后台消费它推回来的事件流。
 //
 // 这个方法是非阻塞的:建流成功就返回,事件在另一个协程里收。
+// 熔断器怎么记这条路径的结果,值得单独说一句:
+//
+// RunTask 是 server-streaming,`c.cli.RunTask(...)` **不等对面回话就返回**
+// (gRPC 只是把请求排上,头都还没发)。所以它返回 nil 完全不能说明 Agent 活着 ——
+// Agent 进程没了的时候它照样返回 nil,错误要到第一次 Recv() 才浮出来。
+//
+// 因此这里的 Record 交给 consume 去做:第一条事件收到了才算成功,
+// 流一开头就报错才算失败。在这儿按 RunTask 的返回值记的话,
+// 熔断器会永远认为下游是好的,等于没装。
 func (c *GRPCClient) StartTask(ctx context.Context, req StartTaskReq) error {
 	if c.closing.Load() {
 		return ErrClientClosing
+	}
+	if !c.breaker.Allow() {
+		// 快速失败,不去撞一个已知连不上的 Agent。
+		// 包成 ErrUnavailable 是为了让上层只认一个错误 —— 对调用方来说
+		// "熔断了"和"连不上"要做的事完全一样:别等了,标记失败。
+		return fmt.Errorf("派发任务: %w(%w)", ErrUnavailable, breaker.ErrOpen)
 	}
 
 	// WithoutCancel 是必须的:下面那个协程要活过发起它的那次 HTTP 请求。
@@ -293,7 +350,12 @@ func (c *GRPCClient) StartTask(ctx context.Context, req StartTaskReq) error {
 	})
 	if err != nil {
 		cancel()
-		return err
+		// 这个分支基本只在参数不合法或连接已经关掉时触发(见上面的说明),
+		// 但既然拿了名额就得还回去,否则半开期的探针会漏掉一个,
+		// 熔断器再也回不到 closed。
+		tErr := translateGRPCError("派发任务", err)
+		c.breaker.Record(!countsAsUnhealthy(tErr))
+		return tErr
 	}
 
 	c.wg.Add(1)
@@ -313,8 +375,23 @@ func (c *GRPCClient) StartTask(ctx context.Context, req StartTaskReq) error {
 }
 
 // consume 把流里的事件一条条交给 handler,直到流结束或出错。
+//
+// 它同时负责给熔断器一次(且仅一次)汇报,理由见 StartTask 上面那段注释。
 func (c *GRPCClient) consume(ctx context.Context, taskUID string,
 	stream agentv1.AgentService_RunTaskClient) {
+
+	// 一次 Allow 对应一次 Record,多记会把半开期的计数搞乱,
+	// 少记会让探针名额漏掉。用一个标志钉死"只记第一次结果"。
+	recorded := false
+	record := func(healthy bool) {
+		if recorded {
+			return
+		}
+		recorded = true
+		c.breaker.Record(healthy)
+	}
+	// 兜底:走到这儿还没记过,说明流是正常结束的(EOF),对面是活的。
+	defer func() { record(true) }()
 
 	for {
 		ev, err := stream.Recv()
@@ -322,9 +399,15 @@ func (c *GRPCClient) consume(ctx context.Context, taskUID string,
 			return
 		}
 		if err != nil {
-			c.handler.OnStreamError(ctx, taskUID, err)
+			// 翻译一次再往外交:handler 会把它写进日志,而 OnStreamError
+			// 的实现方(service)拿到的不该是一串带内网地址的 gRPC 原文。
+			tErr := translateGRPCError("接收任务事件流", err)
+			record(!countsAsUnhealthy(tErr))
+			c.handler.OnStreamError(ctx, taskUID, tErr)
 			return
 		}
+		// 收到第一条事件 = 对面确实在干活,这是唯一可信的"健康"证据。
+		record(true)
 		// Agent 报的 task_uid 应该和我们发过去的一致,不一致说明对面串了 ——
 		// 这时候按我们自己的为准,免得一条事件写到别人的任务上。
 		if ev.TaskUid != taskUID {
@@ -350,6 +433,10 @@ func (c *GRPCClient) consume(ctx context.Context, taskUID string,
 
 // CancelTask 告诉 Agent 别跑了。
 func (c *GRPCClient) CancelTask(ctx context.Context, req CancelTaskReq) error {
+	if !c.breaker.Allow() {
+		return fmt.Errorf("取消任务: %w(%w)", ErrUnavailable, breaker.ErrOpen)
+	}
+
 	reqCtx, cancel := context.WithTimeout(ctx, cancelTimeout)
 	defer cancel()
 
@@ -359,14 +446,46 @@ func (c *GRPCClient) CancelTask(ctx context.Context, req CancelTaskReq) error {
 		TraceId: req.TraceID,
 	})
 	if err != nil {
-		return err
+		tErr := translateGRPCError("取消任务", err)
+		c.breaker.Record(!countsAsUnhealthy(tErr))
+		return tErr
 	}
+	// 一元调用不像 RunTask,拿到响应就是真的通了。
+	c.breaker.Record(true)
+
 	if !res.Cancelled {
 		// 带上 Message —— 那是 Agent 唯一能说明"为什么取消不了"的地方。
+		// 这条只进日志(见 service.TaskService.notifyCancel),不回显给用户。
 		return fmt.Errorf("%w: %s", ErrCancelTask, res.Message)
 	}
 	return nil
 }
+
+// Health 问一次 Agent 活着没有。
+//
+// **它刻意不走熔断器**,既不占名额也不汇报结果:
+//
+//   - 不 Allow:熔断打开时探活更该照常发出去,否则一旦断开就再也
+//     看不到"对面回来了"。半开期那一个宝贵的探针名额也不该被监控轮询吃掉。
+//   - 不 Record:/health 通常被按秒轮询,让它去驱动熔断器,等于把
+//     熔断器的状态机交给了监控系统的采集频率 —— 真实业务流量反而说了不算。
+//
+// 熔断器的状态由 BreakerState 单独报,两个字段各说各的:
+// agent=up 而 breaker=open 是一个完全合理(而且很有用)的组合,
+// 意思是"对面已经恢复了,业务流量再过几秒也会恢复"。
+func (c *GRPCClient) Health(ctx context.Context) (HealthStatus, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, healthTimeout)
+	defer cancel()
+
+	res, err := c.cli.Health(reqCtx, &agentv1.HealthRequest{})
+	if err != nil {
+		return HealthStatus{}, translateGRPCError("探测执行器", err)
+	}
+	return HealthStatus{OK: res.Ok, Version: res.Version}, nil
+}
+
+// BreakerState 返回熔断器当前状态,只读。
+func (c *GRPCClient) BreakerState() string { return c.breaker.State().String() }
 
 // Close 停止接新任务,等在途的事件流收完,然后关连接。
 //

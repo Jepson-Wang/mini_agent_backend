@@ -159,6 +159,14 @@ func (f *fakeAgent) CancelTask(_ context.Context, req agentclient.CancelTaskReq)
 	return f.err
 }
 
+// Health / BreakerState 只为满足 agentclient.Client。
+// service 这一层用不上它们 —— 探活是 /health 的事,归 handler。
+func (f *fakeAgent) Health(context.Context) (agentclient.HealthStatus, error) {
+	return agentclient.HealthStatus{OK: true}, nil
+}
+
+func (f *fakeAgent) BreakerState() string { return "closed" }
+
 // canceledUIDs 只要 task_uid,大多数用例关心的就是这个。
 func (f *fakeAgent) canceledUIDs() []string {
 	uids := make([]string, 0, len(f.canceled))
