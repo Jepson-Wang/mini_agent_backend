@@ -27,6 +27,18 @@ var (
 	// 也必须完全一致,否则登录接口就成了账号探测器。
 	ErrInvalidCredentials = errors.New("invalid credentials")
 
+	// ErrAgentUnavailable 执行器(Agent)连不上,或者熔断器已经打开。
+	//
+	// 定在 model 而不是直接用 agentclient 的哨兵:response 包要按错误查表,
+	// 让它 import agentclient 等于把响应外壳挂到 gRPC 基础设施上 ——
+	// 以后换个执行方式(HTTP、消息队列),这张表就得跟着改。
+	// service 层负责把 agentclient 的错误翻成这两个,见 service.translateAgentErr。
+	ErrAgentUnavailable = errors.New("agent unavailable")
+
+	// ErrAgentTimeout 执行器在时限内没回话。
+	// 和 ErrAgentUnavailable 分开:超时的请求可能已经在对面跑起来了。
+	ErrAgentTimeout = errors.New("agent timeout")
+
 	// ErrUserDisabled 账号不可登录(封禁、注销等)。
 	//
 	// 它和 ErrInvalidCredentials 分开是安全的,前提是**先校验口令再看状态**:

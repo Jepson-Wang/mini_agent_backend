@@ -16,6 +16,19 @@ const (
 	CodeConflict         = 40900 // 和资源当前状态冲突(比如去取消一个已经跑完的任务)
 	CodeQuotaExceeded    = 42900 // 超出配额
 	CodeInternal         = 50000 // 内部错误
+
+	// CodeUnavailable 依赖的下游暂时不可用(现在只有 Agent)。
+	//
+	// 和 CodeInternal 分开是有实际意义的:503 告诉客户端"这次不算数,
+	// 过会儿重试有用",而 500 意味着"重试大概率还是这个结果"。
+	// 全都回 500 的话,前端只能一律弹"系统错误",用户也就不会再试了。
+	CodeUnavailable = 50300
+
+	// CodeGatewayTimeout 下游在时限内没回话。
+	//
+	// 特意和 CodeUnavailable 分开:超时意味着请求**可能已经送到并执行了**,
+	// 所以对非幂等的操作,客户端不该无脑重试。
+	CodeGatewayTimeout = 50400
 )
 
 // codeText 是每个码的兜底文案,Fail 传空 message 时用。
@@ -30,6 +43,8 @@ var codeText = map[int]string{
 	CodeConflict:         "当前状态下无法执行该操作",
 	CodeQuotaExceeded:    "超出配额",
 	CodeInternal:         "内部错误",
+	CodeUnavailable:      "服务暂时不可用,请稍后重试",
+	CodeGatewayTimeout:   "服务响应超时,请稍后重试",
 }
 
 // Text 返回错误码的默认文案,未登记的码返回内部错误的文案。

@@ -98,8 +98,11 @@ func (s *SessionService) dispatch(ctx context.Context, task *model.Task) *model.
 	slog.Error("派发任务给 Agent 失败,标记为失败",
 		"task_uid", task.TaskUID, "trace_id", traceID, "error", err)
 
-	// 给用户看的原因不带 err 原文 —— 那里面是 gRPC 的地址和错误码。
-	msg := "任务派发失败:执行器暂时不可用"
+	// 给用户看的原因是一句固定文案,不带 err 原文。
+	// agentclient 那边已经把 gRPC 的地址和 message 断掉了,这里再兜一层:
+	// error_msg 是会跟着任务详情回显出去的,不能让下游的错误文本
+	// 变成对外契约的一部分。
+	msg := agentFailureReason(translateAgentErr(err))
 	applied, markErr := s.repo.Task.MarkFailed(ctx, task.TaskUID, &msg)
 	if markErr != nil {
 		// 记录已经在库里了,标记失败又失败 —— 只能记下来,

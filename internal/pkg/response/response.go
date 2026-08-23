@@ -104,6 +104,14 @@ var errRules = []errRule{
 	// binding 的 oneof 已经挡过一层了。
 	{model.ErrTaskStatusInvalid, CodeInvalidParam, "任务状态不合法"},
 
+	// 执行器不可用 / 超时。用 503、504 而不是 500:这两种"过会儿再试有用",
+	// 而 500 的含义是"再试也一样"。混在一起的话,前端只能一律弹"系统错误"。
+	//
+	// 文案里不带地址、端口和 gRPC 状态码 —— 那些是内部拓扑,
+	// 翻译在 agentclient 那一层就已经把原文断掉了(见 translateGRPCError)。
+	{model.ErrAgentUnavailable, CodeUnavailable, "执行器暂时不可用,请稍后重试"},
+	{model.ErrAgentTimeout, CodeGatewayTimeout, "执行器响应超时,请稍后重试"},
+
 	// model.ErrSessionExists / ErrTaskExists 故意不登记:
 	// 它们意味着 ULID 撞了,属于内部故障,不该让客户端看见细节。
 }
