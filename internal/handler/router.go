@@ -16,6 +16,11 @@ type Deps struct {
 	// DB 给健康检查探活用。传 nil 则 /health 不探数据库。
 	DB *gorm.DB
 
+	// Agent 给健康检查探 Agent 用。传 nil 则 /health 里 agent 字段是 skipped。
+	//
+	// 探不通只会让 /health 报 degraded,不会 500 —— 理由见 HealthHandler.Check。
+	Agent AgentProber
+
 	// Verifier 校验访问令牌。私有路由组靠它。
 	// 传 nil 的话私有接口一律 500 而不是放行,见 middleware.Auth。
 	Verifier middleware.TokenVerifier
@@ -77,7 +82,7 @@ func NewRouter(d Deps) *gin.Engine {
 
 	// ---- 公开路由 ----
 
-	health := NewHealthHandler(d.DB)
+	health := NewHealthHandler(d.DB, d.Agent)
 	r.GET("/health", health.Check)
 
 	api := r.Group("/api/v1")
