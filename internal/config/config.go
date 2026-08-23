@@ -7,6 +7,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,10 +28,11 @@ const DefaultEnvPath = ".env"
 const minSecretLen = 32
 
 type Config struct {
-	Server   Server   `yaml:"server"`
-	Database Database `yaml:"database"`
-	Agent    Agent    `yaml:"agent"`
-	JWT      JWT      `yaml:"jwt"`
+	Server    Server    `yaml:"server"`
+	Database  Database  `yaml:"database"`
+	Agent     Agent     `yaml:"agent"`
+	Reconcile Reconcile `yaml:"reconcile"`
+	JWT       JWT       `yaml:"jwt"`
 }
 
 type Server struct {
@@ -66,6 +68,39 @@ type Agent struct {
 	// 这是"接口用不了",不是"接口没防护",所以不用把整个进程拦在门外。
 	// 但只要填了,就得够长。
 	CallbackSecret string `yaml:"-"`
+
+	// BreakerThreshold 连续多少次"下游有病"就熔断,0 表示不启用熔断。
+	//
+	// 数的是连续失败而不是失败率:这个客户端调用量很低(一次任务一两个 RPC),
+	// 失败率在小样本上抖得厉害。什么样的错误算"有病"由 agentclient 判断,
+	// 参数错之类的不算 —— 见 agentclient.countsAsUnhealthy。
+	BreakerThreshold int `yaml:"breaker_threshold"`
+
+	// BreakerCooldown 熔断打开后要等多久才放一个探针出去。
+	// BreakerThreshold > 0 时必须大于 0。
+	BreakerCooldown time.Duration `yaml:"breaker_cooldown"`
+}
+
+// Reconcile 是任务回收器的参数。
+//
+// 它存在的理由:同步 Agent 只有事件流这一条汇报通道。进程重启、
+// 流被中间设备掐断、Agent 被 kill —— 这些情况下没有任何人会来报结果,
+// 任务就永远停在 pending / running,前端界面上一直转圈。
+type Reconcile struct {
+	// Interval 多久扫一次。<= 0 表示**关掉回收器**。
+	Interval time.Duration `yaml:"interval"`
+
+	// StaleAfter 一个中间态任务多久没动静就算卡住了。
+	//
+	// 这里要对比的是「Agent 两次事件之间的最长间隔」,**不是任务总时长**:
+	// 任务只要还在推进度事件(thinking / tool_call / ...),
+	// TaskEventHandler 就会给它续一次 updated_at(见 TaskService.Heartbeat)。
+	// 所以一个跑两小时的任务不会被误杀,一个静默 15 分钟的任务才会。
+	StaleAfter time.Duration `yaml:"stale_after"`
+
+	// Batch 一轮最多处理多少个。夹住是为了别让一次积压把库打满。
+	// 处理不完没关系,下一轮接着来。
+	Batch int `yaml:"batch"`
 }
 
 type JWT struct {
@@ -89,8 +124,15 @@ func defaults() Config {
 	return Config{
 		Server: Server{Addr: ":8080"},
 		Agent: Agent{
-			Addr:        "localhost:50051",
-			TaskTimeout: DefaultAgentTaskTimeout,
+			Addr:             "localhost:50051",
+			TaskTimeout:      DefaultAgentTaskTimeout,
+			BreakerThreshold: 5,
+			BreakerCooldown:  30 * time.Second,
+		},
+		Reconcile: Reconcile{
+			Interval:   time.Minute,
+			StaleAfter: 15 * time.Minute,
+			Batch:      100,
 		},
 		JWT: JWT{
 			Issuer:    "mini-agent",
@@ -170,19 +212,26 @@ func (c *Config) applyEnv() error {
 	setString(&c.JWT.Issuer, "JWT_ISSUER")
 	setString(&c.JWT.Secret, "JWT_SECRET")
 
-	if v := strings.TrimSpace(os.Getenv("JWT_ACCESS_TTL")); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return fmt.Errorf("JWT_ACCESS_TTL=%q 不是合法的时长(例:2h、30m): %w", v, err)
-		}
-		c.JWT.AccessTTL = d
+	if err := setDuration(&c.JWT.AccessTTL, "JWT_ACCESS_TTL"); err != nil {
+		return err
 	}
-	if v := strings.TrimSpace(os.Getenv("AGENT_TASK_TIMEOUT")); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return fmt.Errorf("AGENT_TASK_TIMEOUT=%q 不是合法的时长(例:30m、1h): %w", v, err)
-		}
-		c.Agent.TaskTimeout = d
+	if err := setDuration(&c.Agent.TaskTimeout, "AGENT_TASK_TIMEOUT"); err != nil {
+		return err
+	}
+	if err := setDuration(&c.Agent.BreakerCooldown, "AGENT_BREAKER_COOLDOWN"); err != nil {
+		return err
+	}
+	if err := setInt(&c.Agent.BreakerThreshold, "AGENT_BREAKER_THRESHOLD"); err != nil {
+		return err
+	}
+	if err := setDuration(&c.Reconcile.Interval, "RECONCILE_INTERVAL"); err != nil {
+		return err
+	}
+	if err := setDuration(&c.Reconcile.StaleAfter, "RECONCILE_STALE_AFTER"); err != nil {
+		return err
+	}
+	if err := setInt(&c.Reconcile.Batch, "RECONCILE_BATCH"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -191,6 +240,36 @@ func setString(dst *string, env string) {
 	if v := os.Getenv(env); v != "" {
 		*dst = v
 	}
+}
+
+// setDuration 解析 "30m" / "1h" 这种写法。变量没设或是空串就不动 dst。
+//
+// 解析失败要报错、不能静默跳过:RECONCILE_INTERVAL=1min(不是合法写法)
+// 被忽略的话,服务会带着默认值跑起来,而运维以为自己改了。
+func setDuration(dst *time.Duration, env string) error {
+	v := strings.TrimSpace(os.Getenv(env))
+	if v == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fmt.Errorf("%s=%q 不是合法的时长(例:30s、15m、1h): %w", env, v, err)
+	}
+	*dst = d
+	return nil
+}
+
+func setInt(dst *int, env string) error {
+	v := strings.TrimSpace(os.Getenv(env))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fmt.Errorf("%s=%q 不是合法的整数: %w", env, v, err)
+	}
+	*dst = n
+	return nil
 }
 
 // Validate 检查配置能不能撑起一次正常启动。
@@ -230,6 +309,36 @@ func (c *Config) Validate() error {
 	}
 	if c.Agent.CallbackSecret != "" && c.Agent.CallbackSecret == c.JWT.Secret {
 		return fmt.Errorf("AGENT_CALLBACK_SECRET 不能和 JWT_SECRET 相同")
+	}
+	if c.Agent.BreakerThreshold < 0 {
+		return fmt.Errorf("agent.breaker_threshold 不能为负,当前为 %d(0 表示不启用熔断)",
+			c.Agent.BreakerThreshold)
+	}
+	// 阈值 > 0 但冷却为 0 的话,熔断器一打开、下一次调用立刻又放行,等于没熔断。
+	// 这种配置看起来是启用了,实际什么也没做 —— 比明确关掉危险。
+	if c.Agent.BreakerThreshold > 0 && c.Agent.BreakerCooldown <= 0 {
+		return fmt.Errorf("启用熔断时 agent.breaker_cooldown 必须大于 0,当前为 %v",
+			c.Agent.BreakerCooldown)
+	}
+	return c.Reconcile.validate()
+}
+
+// validate 校验回收器配置。Interval <= 0 表示关掉,这时其余字段随便填。
+func (r Reconcile) validate() error {
+	if r.Interval <= 0 {
+		return nil
+	}
+	if r.StaleAfter <= 0 {
+		return fmt.Errorf("reconcile.stale_after 必须大于 0,当前为 %v", r.StaleAfter)
+	}
+	// 判定窗口比扫描间隔还短,几乎一定是把两个值写反了。放过去的话,
+	// 一个刚建出来还没来得及跑的任务会在下一轮就被判为卡住并标记失败。
+	if r.StaleAfter < r.Interval {
+		return fmt.Errorf("reconcile.stale_after(%v)不能小于 reconcile.interval(%v)",
+			r.StaleAfter, r.Interval)
+	}
+	if r.Batch <= 0 {
+		return fmt.Errorf("reconcile.batch 必须大于 0,当前为 %d", r.Batch)
 	}
 	return nil
 }

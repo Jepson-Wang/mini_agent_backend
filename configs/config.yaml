@@ -7,6 +7,21 @@ database:
 
 agent:
   addr: "localhost:50051"
+  # 连续多少次"下游有病"就熔断,0 表示关掉熔断。
+  # 参数错、方法没实现这类不算 —— 见 agentclient.countsAsUnhealthy。
+  breaker_threshold: 5
+  # 熔断打开后等多久放一个探针出去。启用熔断时必须大于 0。
+  breaker_cooldown: "30s"
+
+# 任务回收器:把没人再会来报结果的任务收尾(进程重启、流被掐断、Agent 被 kill)。
+reconcile:
+  # 多久扫一次。设成 0 就关掉回收器。
+  interval: "1m"
+  # 中间态任务多久没动静算卡住。比的是**两次事件之间的间隔**,不是任务总时长 ——
+  # 还在推进度的任务会一直被续命(见 TaskService.Heartbeat),不会被误杀。
+  stale_after: "15m"
+  # 一轮最多收几个。收不完下一轮接着来。
+  batch: 100
 
 jwt:
   # 签发方标识,会写进 iss 并在校验时核对。

@@ -27,6 +27,8 @@ func clearEnv(t *testing.T) {
 	for _, k := range []string{
 		"CONFIG_PATH", "ENV_PATH", "APP_ENV", "HTTP_ADDR", "DB_DSN",
 		"AGENT_ADDR", "AGENT_CALLBACK_SECRET", "AGENT_TASK_TIMEOUT",
+		"AGENT_BREAKER_THRESHOLD", "AGENT_BREAKER_COOLDOWN",
+		"RECONCILE_INTERVAL", "RECONCILE_STALE_AFTER", "RECONCILE_BATCH",
 		"JWT_ISSUER", "JWT_SECRET", "JWT_ACCESS_TTL",
 	} {
 		// 两步走。t.Setenv 是为了登记 cleanup,测试结束把原值还回去;
@@ -405,5 +407,132 @@ func TestRepoConfigYAMLIsValid(t *testing.T) {
 	}
 	if cfg.JWT.AccessTTL <= 0 {
 		t.Errorf("access_ttl = %v", cfg.JWT.AccessTTL)
+	}
+}
+
+// ---- 熔断与回收器 ----
+
+func TestLoad_BreakerAndReconcileDefaults(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.BreakerThreshold != 5 {
+		t.Errorf("BreakerThreshold = %d, 期望 5", cfg.Agent.BreakerThreshold)
+	}
+	if cfg.Agent.BreakerCooldown != 30*time.Second {
+		t.Errorf("BreakerCooldown = %v, 期望 30s", cfg.Agent.BreakerCooldown)
+	}
+	if cfg.Reconcile.Interval != time.Minute {
+		t.Errorf("Reconcile.Interval = %v, 期望 1m", cfg.Reconcile.Interval)
+	}
+	if cfg.Reconcile.StaleAfter != 15*time.Minute {
+		t.Errorf("Reconcile.StaleAfter = %v, 期望 15m", cfg.Reconcile.StaleAfter)
+	}
+	if cfg.Reconcile.Batch != 100 {
+		t.Errorf("Reconcile.Batch = %d, 期望 100", cfg.Reconcile.Batch)
+	}
+}
+
+func TestLoad_BreakerAndReconcileFromEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("AGENT_BREAKER_THRESHOLD", "9")
+	t.Setenv("AGENT_BREAKER_COOLDOWN", "45s")
+	t.Setenv("RECONCILE_INTERVAL", "2m")
+	t.Setenv("RECONCILE_STALE_AFTER", "20m")
+	t.Setenv("RECONCILE_BATCH", "7")
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.BreakerThreshold != 9 || cfg.Agent.BreakerCooldown != 45*time.Second {
+		t.Errorf("熔断参数没被环境变量覆盖: %+v", cfg.Agent)
+	}
+	if cfg.Reconcile.Interval != 2*time.Minute ||
+		cfg.Reconcile.StaleAfter != 20*time.Minute || cfg.Reconcile.Batch != 7 {
+		t.Errorf("回收器参数没被环境变量覆盖: %+v", cfg.Reconcile)
+	}
+}
+
+// 环境变量写错了要报错,不能静默忽略 —— 那会让人以为自己改了配置,
+// 而服务其实还跑着默认值。
+func TestLoad_BadBreakerAndReconcileEnv(t *testing.T) {
+	for _, tc := range []struct{ env, val string }{
+		{"AGENT_BREAKER_THRESHOLD", "五次"},
+		{"AGENT_BREAKER_COOLDOWN", "30秒"},
+		{"RECONCILE_INTERVAL", "1min"}, // 合法写法是 1m
+		{"RECONCILE_BATCH", "一百"},
+	} {
+		t.Run(tc.env, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("JWT_SECRET", testSecret)
+			t.Setenv(tc.env, tc.val)
+
+			if _, err := Load(writeYAML(t, minimalYAML)); err == nil {
+				t.Errorf("%s=%q 该报错", tc.env, tc.val)
+			}
+		})
+	}
+}
+
+// 启用熔断却把冷却配成 0:打开之后下一次调用立刻又放行,等于没熔断。
+// 这种"看起来启用了、实际什么也没做"的配置比明确关掉更危险。
+func TestLoad_BreakerEnabledNeedsCooldown(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("AGENT_BREAKER_COOLDOWN", "0s")
+
+	if _, err := Load(writeYAML(t, minimalYAML)); err == nil {
+		t.Fatal("启用熔断但冷却为 0 应当报错")
+	}
+}
+
+// 关掉熔断是合法的部署选择(本地开发),不该顺带校验冷却。
+func TestLoad_BreakerDisabledSkipsCooldownCheck(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("AGENT_BREAKER_THRESHOLD", "0")
+	t.Setenv("AGENT_BREAKER_COOLDOWN", "0s")
+
+	if _, err := Load(writeYAML(t, minimalYAML)); err != nil {
+		t.Fatalf("关掉熔断不该报错: %v", err)
+	}
+}
+
+// TestLoad_StaleAfterMustExceedInterval 挡的是两个值写反。
+//
+// 判定窗口比扫描间隔还短的话,一个刚建出来、还没来得及跑的任务
+// 会在下一轮就被判成"卡住了"并标记失败 —— 而且是**所有**任务,
+// 上线之后没人会立刻反应过来是配置的问题。
+func TestLoad_StaleAfterMustExceedInterval(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("RECONCILE_INTERVAL", "15m")
+	t.Setenv("RECONCILE_STALE_AFTER", "1m")
+
+	if _, err := Load(writeYAML(t, minimalYAML)); err == nil {
+		t.Fatal("stale_after 小于 interval 应当报错")
+	}
+}
+
+// interval <= 0 表示关掉回收器,这时其余字段没意义,不该拦。
+func TestLoad_ReconcileDisabledSkipsChecks(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("RECONCILE_INTERVAL", "0s")
+	t.Setenv("RECONCILE_STALE_AFTER", "0s")
+	t.Setenv("RECONCILE_BATCH", "0")
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("关掉回收器不该报错: %v", err)
+	}
+	if cfg.Reconcile.Interval > 0 {
+		t.Errorf("Reconcile.Interval = %v, 期望 <= 0", cfg.Reconcile.Interval)
 	}
 }
