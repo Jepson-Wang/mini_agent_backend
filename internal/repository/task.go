@@ -65,7 +65,7 @@ func (r *TaskRepo) MarkRunning(ctx context.Context, taskUID string) (bool, error
 
 // MarkSucceeded 把任务标记为成功。
 func (r *TaskRepo) MarkSucceeded(ctx context.Context, taskUID string) (bool, error) {
-	return r.cas(ctx, taskUID, []string{model.TaskPending, model.TaskRunning}, map[string]any{
+	return r.cas(ctx, taskUID, activeStatuses, map[string]any{
 		"status":      model.TaskSucceeded,
 		"finished_at": time.Now(),
 	})
@@ -74,7 +74,7 @@ func (r *TaskRepo) MarkSucceeded(ctx context.Context, taskUID string) (bool, err
 // MarkFailed 把任务标记为失败。errMsg 传 nil 表示不记原因,
 // 落库是 NULL 而不是空串。
 func (r *TaskRepo) MarkFailed(ctx context.Context, taskUID string, errMsg *string) (bool, error) {
-	return r.cas(ctx, taskUID, []string{model.TaskPending, model.TaskRunning}, map[string]any{
+	return r.cas(ctx, taskUID, activeStatuses, map[string]any{
 		"status":      model.TaskFailed,
 		"error_msg":   errMsg,
 		"finished_at": time.Now(),
@@ -89,7 +89,7 @@ func (r *TaskRepo) MarkFailed(ctx context.Context, taskUID string, errMsg *strin
 // 用户点取消和 Agent 报完成撞在一起时,这一条 UPDATE 的行锁就是仲裁者,
 // 不需要在上层加锁,也不需要先查再写。
 func (r *TaskRepo) MarkCanceled(ctx context.Context, taskUID string, reason *string) (bool, error) {
-	return r.cas(ctx, taskUID, []string{model.TaskPending, model.TaskRunning}, map[string]any{
+	return r.cas(ctx, taskUID, activeStatuses, map[string]any{
 		"status":        model.TaskCanceled,
 		"cancel_reason": reason,
 		"finished_at":   time.Now(),
@@ -106,6 +106,64 @@ func (r *TaskRepo) cas(ctx context.Context, taskUID string, from []string, value
 	res := r.db.WithContext(ctx).Model(&model.Task{}).
 		Where("task_uid = ? AND status IN ?", taskUID, from).
 		Updates(values)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// activeStatuses 是「还能被推动」的状态。
+// 单独拎出来是因为 ListStale 也要用它,而它必须和 cas 的 from 一致 ——
+// 两边漂了的话,回收器会去捞一些它根本改不动的行,然后每一轮重复捞一次。
+var activeStatuses = []string{model.TaskPending, model.TaskRunning}
+
+// ListStale 列出卡住的任务:还在中间态,但 updated_at 已经早于 before。
+//
+// 这是 idx_tasks_status_updated 的第一个(也是目前唯一的)消费者 ——
+// 那个索引本来就是为这条查询建的:status 等值在前、updated_at 范围在后,
+// 正好是 B-tree 能一次走完的形状。
+//
+// 按 updated_at 升序:卡得最久的先处理。一次积压超过 limit 时,
+// 这个顺序保证下一轮不会又从头捞同一批(它们已经被改成终态了)。
+func (r *TaskRepo) ListStale(ctx context.Context, before time.Time, limit int) ([]model.Task, error) {
+	if limit <= 0 {
+		// 和 ListBySession 同一个坑:GORM 的 Limit(<=0) 是**不写 LIMIT 子句**,
+		// 也就是把整张表捞进内存。回收器是后台循环,真发生了没人会看见。
+		return nil, nil
+	}
+
+	var ts []model.Task
+	err := r.db.WithContext(ctx).
+		Where("status IN ? AND updated_at < ?", activeStatuses, before).
+		Order("updated_at ASC").
+		Limit(limit).
+		Find(&ts).Error
+	if err != nil {
+		return nil, err
+	}
+	return ts, nil
+}
+
+// Touch 给任务续一次 updated_at,表示"它还活着"。
+// 返回 false 表示这次没写(任务已是终态,或者离上次续命还不够久)。
+//
+// notBefore 是**节流阀**:只有 updated_at 早于它的行才会被更新。
+// 节流放在 WHERE 里而不是内存里,是刻意的 ——
+//
+//   - 内存里记"上次 touch 时间"要按 task_uid 存一张表,还得清理;
+//   - 多副本部署时每个副本各记各的,节流就失效了;
+//   - 而这条 UPDATE 本身就是原子的,不需要额外同步。
+//
+// 代价是每次都发一条 SQL 出去,但那是一条走唯一索引的 UPDATE,
+// 命中不了就是 0 行,比维护一份内存状态便宜得多。
+//
+// 只续 running,不续 pending:pending 意味着还没交接成功,
+// 那正是回收器该来看一眼的状态,给它续命等于把问题永远藏起来。
+func (r *TaskRepo) Touch(ctx context.Context, taskUID string, notBefore time.Time) (bool, error) {
+	res := r.db.WithContext(ctx).Model(&model.Task{}).
+		Where("task_uid = ? AND status = ? AND updated_at < ?",
+			taskUID, model.TaskRunning, notBefore).
+		Update("updated_at", time.Now())
 	if res.Error != nil {
 		return false, res.Error
 	}
