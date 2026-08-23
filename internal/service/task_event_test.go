@@ -293,3 +293,75 @@ func TestTaskEventHandler_CannotReviveCanceledTask(t *testing.T) {
 		}
 	})
 }
+
+// ---- 心跳 ----
+
+// TestTaskEventHandler_ProgressEventsSendHeartbeat 盯着回收器和长任务的接缝。
+//
+// 进度事件不改状态,所以很容易被当成"什么都不用做"。但它是一个跑很久的
+// 任务**唯一**的活着证据:不续 updated_at 的话,一个中间只有 thinking /
+// tool_call 的任务撑过 stale_after 就会被回收器当成卡住的收掉,
+// 而它其实跑得好好的。这种误杀只在长任务上出现,本地几乎复现不出来。
+func TestTaskEventHandler_ProgressEventsSendHeartbeat(t *testing.T) {
+	for _, evType := range []agentclient.EventType{
+		agentclient.EventThinking,
+		agentclient.EventToolCall,
+		agentclient.EventToolResult,
+		agentclient.EventUnknown,
+	} {
+		t.Run(string(evType), func(t *testing.T) {
+			w := newFakeStatusWriter()
+			h := NewTaskEventHandler(w)
+
+			err := h.OnEvent(context.Background(), agentclient.Event{
+				TaskUID: evUID, Type: evType, Seq: 1, Payload: "内容",
+			})
+			if err != nil {
+				t.Fatalf("OnEvent: %v", err)
+			}
+			if len(w.touched) != 1 || w.touched[0] != evUID {
+				t.Errorf("进度事件没有续命(touched=%v),长任务会被回收器误杀", w.touched)
+			}
+			if len(w.calls) != 0 {
+				t.Errorf("进度事件不该写状态,却写了 %d 次", len(w.calls))
+			}
+		})
+	}
+}
+
+// 改状态的事件本身就会刷新 updated_at(cas 那条 UPDATE 带着它),
+// 不需要再额外发一条心跳 —— 多一条就是多一次写同一行。
+func TestTaskEventHandler_StatusEventsDoNotHeartbeat(t *testing.T) {
+	for _, evType := range []agentclient.EventType{
+		agentclient.EventStarted, agentclient.EventFinished, agentclient.EventError,
+	} {
+		t.Run(string(evType), func(t *testing.T) {
+			w := newFakeStatusWriter()
+			h := NewTaskEventHandler(w)
+
+			if err := h.OnEvent(context.Background(), agentclient.Event{
+				TaskUID: evUID, Type: evType, Seq: 1,
+			}); err != nil {
+				t.Fatalf("OnEvent: %v", err)
+			}
+			if len(w.touched) != 0 {
+				t.Errorf("状态事件不该再单独发心跳,cas 那条 UPDATE 已经刷过 updated_at 了")
+			}
+		})
+	}
+}
+
+// 心跳失败不能中断事件处理:续命是尽力而为的一步,
+// 而这条路径上真正要紧的是别让后面的事件(尤其是 finished)收不到。
+func TestTaskEventHandler_HeartbeatFailureIsSwallowed(t *testing.T) {
+	w := newFakeStatusWriter()
+	w.touchErr = errors.New("库挂了")
+	h := NewTaskEventHandler(w)
+
+	err := h.OnEvent(context.Background(), agentclient.Event{
+		TaskUID: evUID, Type: agentclient.EventThinking, Seq: 1,
+	})
+	if err != nil {
+		t.Errorf("心跳失败不该往上抛: %v", err)
+	}
+}

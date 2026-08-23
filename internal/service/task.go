@@ -18,6 +18,17 @@ import (
 // 短一点:这一步是 best-effort,不该让用户的取消请求跟着它一起卡。
 const notifyTimeout = 3 * time.Second
 
+// touchInterval 同一个任务两次心跳之间的最小间隔。
+//
+// 不加节流的话,一个话痨 Agent 每秒推几十条进度事件,就是每秒几十条
+// UPDATE 打在同一行上 —— 行锁排队,还把 idx_tasks_status_updated
+// 搅得到处是死元组。而心跳要回答的问题只有一个:"这任务过去 N 分钟
+// 有没有动静",精确到秒毫无意义。
+//
+// 它必须远小于 reconcile.stale_after(默认 15 分钟),否则续命的频率
+// 追不上判死的窗口,长任务照样会被回收器误杀。
+const touchInterval = 30 * time.Second
+
 // TaskService 负责任务的读取、取消,以及消费 Agent 报上来的状态回调。
 type TaskService struct {
 	repo  *repository.Repository
@@ -147,6 +158,23 @@ func (s *TaskService) HandleCallback(ctx context.Context, taskUID, status string
 		s.logIgnoredCallback(ctx, taskUID, status)
 	}
 	return applied, nil
+}
+
+// Heartbeat 给一个正在跑的任务续命,让回收器别把它当成卡住的。
+//
+// 只有 running 的任务会被续(见 repository.TaskRepo.Touch),而且有节流,
+// 所以调用方可以对**每一条**进度事件都调它,不用自己判断该不该调。
+//
+// 返回 error 只代表数据库出问题了。"没续上"(任务已经是终态、
+// 或者离上次续命不够久)不是错误,也不需要让调用方知道 ——
+// 这是尽力而为的一步:漏一次心跳最坏的结果是任务早 15 分钟被收掉,
+// 而为了它去打断事件处理反而更糟。
+func (s *TaskService) Heartbeat(ctx context.Context, taskUID string) error {
+	if taskUID == "" {
+		return nil
+	}
+	_, err := s.repo.Task.Touch(ctx, taskUID, time.Now().Add(-touchInterval))
+	return err
 }
 
 // logIgnoredCallback 区分"迟到"和"根本不存在"。

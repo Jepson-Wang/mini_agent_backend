@@ -26,6 +26,10 @@ const maxEventErrMsg = 2000
 // 见 cmd/server/main.go 里的接线注释。
 type taskStatusWriter interface {
 	HandleCallback(ctx context.Context, taskUID, status string, errMsg *string) (bool, error)
+
+	// Heartbeat 给正在跑的任务续一次命,防止回收器把它当成卡住的。
+	// 有节流,可以对每条进度事件都调。
+	Heartbeat(ctx context.Context, taskUID string) error
 }
 
 // TaskEventHandler 把 Agent 推上来的事件流翻成任务状态。
@@ -71,6 +75,18 @@ func (h *TaskEventHandler) OnEvent(ctx context.Context, ev agentclient.Event) er
 		slog.Info("任务进度",
 			"task_uid", ev.TaskUID, "seq", ev.Seq,
 			"type", string(ev.Type), "trace_id", traceID)
+
+		// 进度事件不改状态,但它是"这任务还活着"的唯一证据 ——
+		// 一个跑二十分钟的任务,中间只有 thinking / tool_call,
+		// 不续命的话回收器会把它当成卡住的收掉。
+		//
+		// 心跳失败不往上抛:上层拿到 error 只会记一条日志,而这条路径上
+		// 真正要紧的是**别中断事件流**。这里自己消化并记一条 Warn,
+		// 符合"一个错误只上报一次"。
+		if err := h.tasks.Heartbeat(ctx, ev.TaskUID); err != nil {
+			slog.Warn("刷新任务心跳失败",
+				"task_uid", ev.TaskUID, "seq", ev.Seq, "trace_id", traceID, "error", err)
+		}
 		return nil
 	}
 

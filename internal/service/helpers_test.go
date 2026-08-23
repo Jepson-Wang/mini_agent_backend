@@ -201,6 +201,11 @@ type fakeStatusWriter struct {
 	calls   []statusCall
 	applied bool
 	err     error
+
+	// touched 记下每次心跳的 task_uid,用来验"进度事件有没有续命"。
+	touched []string
+	// touchErr 让心跳报错,验它不会把事件处理带崩。
+	touchErr error
 }
 
 func newFakeStatusWriter() *fakeStatusWriter {
@@ -215,6 +220,11 @@ func (f *fakeStatusWriter) HandleCallback(_ context.Context, taskUID, status str
 		return false, f.err
 	}
 	return f.applied, nil
+}
+
+func (f *fakeStatusWriter) Heartbeat(_ context.Context, taskUID string) error {
+	f.touched = append(f.touched, taskUID)
+	return f.touchErr
 }
 
 // seedTask 建一个用户、一个会话和一个 pending 任务,返回用户 id 和 task_uid。
