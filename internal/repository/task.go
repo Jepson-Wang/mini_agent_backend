@@ -63,10 +63,12 @@ func (r *TaskRepo) MarkRunning(ctx context.Context, taskUID string) (bool, error
 	})
 }
 
-// MarkSucceeded 把任务标记为成功。
-func (r *TaskRepo) MarkSucceeded(ctx context.Context, taskUID string) (bool, error) {
+// MarkSucceeded 把任务标记为成功。output 是最终答复,传 nil 表示没有
+// (落库 NULL 而不是空串,和 MarkFailed 的 errMsg 一个道理)。
+func (r *TaskRepo) MarkSucceeded(ctx context.Context, taskUID string, output *string) (bool, error) {
 	return r.cas(ctx, taskUID, activeStatuses, map[string]any{
 		"status":      model.TaskSucceeded,
+		"output":      output,
 		"finished_at": time.Now(),
 	})
 }

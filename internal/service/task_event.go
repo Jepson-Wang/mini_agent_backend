@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -19,13 +20,49 @@ import (
 // gRPC 这条路没有 binding tag,只能在这儿挡。两边数字保持一致。
 const maxEventErrMsg = 2000
 
+// maxEventOutput 最终答复的截断长度。
+//
+// 比 error_msg 宽得多:这是给用户看的正文,截短了就没法用了。
+// 但仍然必须有上限 —— tasks.output 是一列 text,数据库自己不设限,
+// 而它会跟着任务详情原样发回给用户。
+const maxEventOutput = 64 * 1024
+
+// finishedPayload 是 finished 事件 payload 的形状,由 Agent 那边拼出来
+// (grpcserver/server.py 里的 json.dumps(out))。
+//
+// 只解出要用的那个字段。多余的键(completed / used_turns)留在 JSON 里
+// 不管 —— 对面加字段不该让这边解析失败。
+type finishedPayload struct {
+	FinalResponse string `json:"final_response"`
+}
+
+// outputFromPayload 从 finished 事件里取出最终答复。
+//
+// 解不出来时返回 nil 并记一条 Warn,**不让整条事件失败**:状态是
+// "成功"这件事比正文更要紧,把它一起丢掉的话任务会永远停在 running,
+// 而那是个比"答案没显示出来"糟糕得多的结局。
+//
+// 也不把原始 payload 当答案兜底 —— 那样用户会看到一坨 JSON。
+func outputFromPayload(payload, taskUID, traceID string) *string {
+	if strings.TrimSpace(payload) == "" {
+		return nil
+	}
+	var p finishedPayload
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		slog.Warn("finished 事件的 payload 不是预期的 JSON,答复将不落库",
+			"task_uid", taskUID, "trace_id", traceID, "error", err)
+		return nil
+	}
+	return truncate(p.FinalResponse, maxEventOutput)
+}
+
 // taskStatusWriter 是事件处理器需要的能力,生产实现是 *TaskService。
 //
 // 定成接口是为了打破一个构造环:TaskService 要 agentclient.Client,
 // 客户端要 EventHandler,而 EventHandler 又要回头调 TaskService。
 // 见 cmd/server/main.go 里的接线注释。
 type taskStatusWriter interface {
-	HandleCallback(ctx context.Context, taskUID, status string, errMsg *string) (bool, error)
+	HandleCallback(ctx context.Context, taskUID, status string, res CallbackResult) (bool, error)
 
 	// Heartbeat 给正在跑的任务续一次命,防止回收器把它当成卡住的。
 	// 有节流,可以对每条进度事件都调。
@@ -90,13 +127,17 @@ func (h *TaskEventHandler) OnEvent(ctx context.Context, ev agentclient.Event) er
 		return nil
 	}
 
-	// 只有 failed 才带原因 —— 成功的任务不该留着上一次的错误信息。
-	var errMsg *string
-	if status == model.TaskFailed {
-		errMsg = truncate(ev.Payload, maxEventErrMsg)
+	// 只有 failed 才带原因、只有 succeeded 才带答复 —— 成功的任务不该留着
+	// 上一次的错误信息,失败的任务也不该有正文。
+	var res CallbackResult
+	switch status {
+	case model.TaskFailed:
+		res.ErrorMsg = truncate(ev.Payload, maxEventErrMsg)
+	case model.TaskSucceeded:
+		res.Output = outputFromPayload(ev.Payload, ev.TaskUID, traceID)
 	}
 
-	applied, err := h.tasks.HandleCallback(ctx, ev.TaskUID, status, errMsg)
+	applied, err := h.tasks.HandleCallback(ctx, ev.TaskUID, status, res)
 	if err != nil {
 		return fmt.Errorf("事件 %s(seq=%d)写库失败: %w", ev.Type, ev.Seq, err)
 	}
@@ -131,7 +172,8 @@ func (h *TaskEventHandler) OnStreamError(ctx context.Context, taskUID string, er
 	// 地址、端口、gRPC 内部细节,而 error_msg 是会回显给用户的。
 	msg := truncate("与执行器的连接中断", maxEventErrMsg)
 
-	applied, err := h.tasks.HandleCallback(ctx, taskUID, model.TaskFailed, msg)
+	applied, err := h.tasks.HandleCallback(ctx, taskUID, model.TaskFailed,
+		CallbackResult{ErrorMsg: msg})
 	if err != nil {
 		// 这里没有上层可以返回了,只能记下来。
 		slog.Error("流中断后给任务收尾也失败了",

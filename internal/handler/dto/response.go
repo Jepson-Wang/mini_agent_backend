@@ -158,6 +158,10 @@ type TaskResp struct {
 	// 写这个值的地方(dto.TaskCallbackReq)必须限长,否则这里会跟着一起爆。
 	ErrorMsg *string `json:"error_msg"`
 
+	// Output 是 Agent 的最终答复,只有 succeeded 的任务才有,其余恒为 null。
+	// 前端的对话页就是靠它渲染回复的。
+	Output *string `json:"output"`
+
 	// CancelReason 是用户自己填的取消理由,原样回显。
 	// 不是终态 canceled 的任务这里恒为 null。
 	CancelReason *string `json:"cancel_reason"`
@@ -179,6 +183,7 @@ func NewTaskResp(t *model.Task) *TaskResp {
 		Status:       t.Status,
 		Input:        t.Input,
 		ErrorMsg:     t.ErrorMsg,
+		Output:       t.Output,
 		CancelReason: t.CancelReason,
 
 		StartedAt:  t.StartedAt,

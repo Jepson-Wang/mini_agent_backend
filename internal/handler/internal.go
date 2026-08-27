@@ -7,6 +7,7 @@ import (
 
 	"github.com/Jepson-Wang/mini_agent_backend/internal/handler/dto"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/response"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/service"
 )
 
 // TaskCallbackService 是内部回调接口需要的能力。
@@ -14,7 +15,8 @@ import (
 // 签名里没有 userID,这是刻意的:回调方是 Agent,不是人,
 // 它证明不了自己代表谁。加一个 userID 参数就等于让调用方自己声明身份。
 type TaskCallbackService interface {
-	HandleCallback(ctx context.Context, taskUID, status string, errMsg *string) (applied bool, err error)
+	HandleCallback(ctx context.Context, taskUID, status string,
+		res service.CallbackResult) (applied bool, err error)
 }
 
 // InternalHandler 处理服务间调用(目前只有 Agent 的任务回调)。
@@ -56,8 +58,11 @@ func (h *InternalHandler) TaskCallback(c *gin.Context) {
 		return
 	}
 
-	applied, err := h.svc.HandleCallback(
-		c.Request.Context(), uid, req.Status, req.NormalizedErrorMsg())
+	applied, err := h.svc.HandleCallback(c.Request.Context(), uid, req.Status,
+		service.CallbackResult{
+			ErrorMsg: req.NormalizedErrorMsg(),
+			Output:   req.NormalizedOutput(),
+		})
 	if err != nil {
 		response.FailFromError(c, err)
 		return

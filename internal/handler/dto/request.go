@@ -132,6 +132,27 @@ type TaskCallbackReq struct {
 	// 数据库自己不设上限。不挡的话对面一次能往库里塞几 MB,
 	// 而且它还会跟着任务详情接口发回给用户。
 	ErrorMsg *string `json:"error_msg" binding:"omitempty,max=2000"`
+
+	// Output 最终答复,只在 status=succeeded 时有意义。
+	//
+	// 有它这条 HTTP 回调通道才和 gRPC 事件流等价 —— 少了的话,
+	// 从这条路汇报的任务会是"成功但没有正文",而两条路本该可以互换。
+	// max 和 service.maxEventOutput 对齐(那边按字符截,这里按字符校验)。
+	Output *string `json:"output" binding:"omitempty,max=65536"`
+}
+
+// NormalizedOutput 返回该写进库的最终答复。
+//
+// 只有 succeeded 才带正文 —— 失败或被取消的任务不该留着一段答复。
+// 空白串归一成 nil,免得库里同时存在 NULL 和 "" 两种"没有正文"。
+func (r TaskCallbackReq) NormalizedOutput() *string {
+	if r.Status != model.TaskSucceeded || r.Output == nil {
+		return nil
+	}
+	if s := strings.TrimSpace(*r.Output); s != "" {
+		return &s
+	}
+	return nil
 }
 
 // NormalizedErrorMsg 返回该写进库的失败原因。

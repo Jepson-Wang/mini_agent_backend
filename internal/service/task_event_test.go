@@ -365,3 +365,88 @@ func TestTaskEventHandler_HeartbeatFailureIsSwallowed(t *testing.T) {
 		t.Errorf("心跳失败不该往上抛: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// finished 事件里的最终答复
+// ---------------------------------------------------------------------------
+
+// finished 的 payload 是 Agent 拼的 JSON(grpcserver/server.py 里的
+// json.dumps(out)),答复在 final_response 字段里。解出来落库,
+// 前端的对话页才有东西可渲染 —— 在此之前这个值是被整个丢掉的。
+func TestOnEvent_FinishedCarriesFinalResponse(t *testing.T) {
+	w := newFakeStatusWriter()
+	h := NewTaskEventHandler(w)
+
+	payload := `{"final_response":"北京今天多云,22 到 30 度。","completed":true,"used_turns":3}`
+	err := h.OnEvent(context.Background(), agentclient.Event{
+		TaskUID: "T1", Type: agentclient.EventFinished, Seq: 9, Payload: payload,
+	})
+	if err != nil {
+		t.Fatalf("OnEvent: %v", err)
+	}
+
+	if len(w.calls) != 1 {
+		t.Fatalf("写了 %d 次状态,期望 1", len(w.calls))
+	}
+	c := w.calls[0]
+	if c.status != model.TaskSucceeded {
+		t.Fatalf("status = %q, 想要 %q", c.status, model.TaskSucceeded)
+	}
+	if c.output == nil {
+		t.Fatal("答复没落库 —— 对话页会是空的")
+	}
+	if *c.output != "北京今天多云,22 到 30 度。" {
+		t.Fatalf("output = %q", *c.output)
+	}
+	// 成功的任务不该带错误信息。
+	if c.errMsg != nil {
+		t.Errorf("成功的任务不该有 error_msg: %q", *c.errMsg)
+	}
+}
+
+// payload 解不出来时**不能**让整条事件失败:状态是"成功"这件事比正文更要紧,
+// 一起丢掉的话任务会永远停在 running,那比"答案没显示出来"糟糕得多。
+// 也不能把原始 payload 当答案兜底 —— 用户会看到一坨 JSON。
+func TestOnEvent_FinishedWithBadPayloadStillSucceeds(t *testing.T) {
+	for _, payload := range []string{"", "   ", "not json at all", "{"} {
+		w := newFakeStatusWriter()
+		h := NewTaskEventHandler(w)
+
+		err := h.OnEvent(context.Background(), agentclient.Event{
+			TaskUID: "T1", Type: agentclient.EventFinished, Seq: 1, Payload: payload,
+		})
+		if err != nil {
+			t.Fatalf("payload=%q 不该让事件失败: %v", payload, err)
+		}
+		if len(w.calls) != 1 || w.calls[0].status != model.TaskSucceeded {
+			t.Fatalf("payload=%q 仍然应当写成 succeeded, calls=%+v", payload, w.calls)
+		}
+		if out := w.calls[0].output; out != nil && *out == payload {
+			t.Fatalf("payload=%q 被当成答案兜底了,用户会看到一坨原文", payload)
+		}
+	}
+}
+
+// 失败的任务只带原因,不带正文 —— 反过来也一样。两个字段混了的话,
+// 用户会把报错当成答案读。
+func TestOnEvent_ErrorCarriesOnlyErrorMsg(t *testing.T) {
+	w := newFakeStatusWriter()
+	h := NewTaskEventHandler(w)
+
+	err := h.OnEvent(context.Background(), agentclient.Event{
+		TaskUID: "T1", Type: agentclient.EventError, Seq: 2, Payload: "模型后端连不上",
+	})
+	if err != nil {
+		t.Fatalf("OnEvent: %v", err)
+	}
+	c := w.calls[0]
+	if c.status != model.TaskFailed {
+		t.Fatalf("status = %q", c.status)
+	}
+	if c.errMsg == nil || *c.errMsg != "模型后端连不上" {
+		t.Fatalf("errMsg = %v", c.errMsg)
+	}
+	if c.output != nil {
+		t.Errorf("失败的任务不该有正文: %q", *c.output)
+	}
+}

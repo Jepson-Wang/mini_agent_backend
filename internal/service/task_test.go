@@ -90,7 +90,7 @@ func TestCancel_LateCallbackCannotRevive(t *testing.T) {
 			t.Fatalf("Cancel: %v", err)
 		}
 
-		applied, err := s.HandleCallback(ctx, uid, model.TaskSucceeded, nil)
+		applied, err := s.HandleCallback(ctx, uid, model.TaskSucceeded, CallbackResult{})
 		if err != nil {
 			t.Fatalf("HandleCallback 不该报错: %v", err)
 		}
@@ -145,7 +145,7 @@ func TestCancel_AlreadyTerminal(t *testing.T) {
 		ctx := context.Background()
 		userID, uid := seedTask(t, r)
 
-		if _, err := r.Task.MarkSucceeded(ctx, uid); err != nil {
+		if _, err := r.Task.MarkSucceeded(ctx, uid, nil); err != nil {
 			t.Fatalf("MarkSucceeded: %v", err)
 		}
 
@@ -193,13 +193,13 @@ func TestHandleCallback_Transitions(t *testing.T) {
 		ctx := context.Background()
 		_, uid := seedTask(t, r)
 
-		applied, err := s.HandleCallback(ctx, uid, model.TaskRunning, nil)
+		applied, err := s.HandleCallback(ctx, uid, model.TaskRunning, CallbackResult{})
 		if err != nil || !applied {
 			t.Fatalf("running: applied=%v err=%v", applied, err)
 		}
 
 		msg := "模型超时"
-		applied, err = s.HandleCallback(ctx, uid, model.TaskFailed, &msg)
+		applied, err = s.HandleCallback(ctx, uid, model.TaskFailed, CallbackResult{ErrorMsg: &msg})
 		if err != nil || !applied {
 			t.Fatalf("failed: applied=%v err=%v", applied, err)
 		}
@@ -227,7 +227,7 @@ func TestHandleCallback_RejectsCanceled(t *testing.T) {
 		ctx := context.Background()
 		_, uid := seedTask(t, r)
 
-		applied, err := s.HandleCallback(ctx, uid, model.TaskCanceled, nil)
+		applied, err := s.HandleCallback(ctx, uid, model.TaskCanceled, CallbackResult{})
 		if !errors.Is(err, model.ErrTaskStatusInvalid) {
 			t.Fatalf("err = %v, 期望 ErrTaskStatusInvalid", err)
 		}
@@ -250,7 +250,7 @@ func TestHandleCallback_RejectsCanceled(t *testing.T) {
 func TestHandleCallback_UnknownTaskIsNotAnError(t *testing.T) {
 	withTaskSvc(t, func(t *testing.T, s *TaskService, _ *repository.Repository, _ *fakeAgent) {
 		applied, err := s.HandleCallback(
-			context.Background(), "01J8ZQXK7PZZZZZZZZZZZZZZZZ", model.TaskSucceeded, nil)
+			context.Background(), "01J8ZQXK7PZZZZZZZZZZZZZZZZ", model.TaskSucceeded, CallbackResult{})
 		if err != nil {
 			t.Fatalf("未知任务不该报错: %v", err)
 		}
@@ -267,12 +267,12 @@ func TestHandleCallback_TerminalIsFinal(t *testing.T) {
 		ctx := context.Background()
 		_, uid := seedTask(t, r)
 
-		if applied, err := s.HandleCallback(ctx, uid, model.TaskSucceeded, nil); err != nil || !applied {
+		if applied, err := s.HandleCallback(ctx, uid, model.TaskSucceeded, CallbackResult{}); err != nil || !applied {
 			t.Fatalf("pending → succeeded 应当成功: applied=%v err=%v", applied, err)
 		}
 
 		msg := "假的失败"
-		applied, err := s.HandleCallback(ctx, uid, model.TaskFailed, &msg)
+		applied, err := s.HandleCallback(ctx, uid, model.TaskFailed, CallbackResult{ErrorMsg: &msg})
 		if err != nil {
 			t.Fatalf("HandleCallback: %v", err)
 		}

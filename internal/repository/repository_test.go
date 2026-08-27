@@ -329,7 +329,7 @@ func TestTaskRepo_MarkSucceeded_LateCallback(t *testing.T) {
 			t.Errorf("新任务 ErrorMsg 应为 nil,实际是 %q", *task.ErrorMsg)
 		}
 
-		ok, err := r.Task.MarkSucceeded(ctx, taskUID)
+		ok, err := r.Task.MarkSucceeded(ctx, taskUID, nil)
 		if err != nil {
 			t.Fatalf("首次标记成功: %v", err)
 		}
@@ -337,7 +337,7 @@ func TestTaskRepo_MarkSucceeded_LateCallback(t *testing.T) {
 			t.Fatal("首次标记应该匹配到 1 行")
 		}
 
-		ok, err = r.Task.MarkSucceeded(ctx, taskUID)
+		ok, err = r.Task.MarkSucceeded(ctx, taskUID, nil)
 		if err != nil {
 			t.Fatalf("重复标记不该报错: %v", err)
 		}
@@ -420,7 +420,7 @@ func TestTaskRepo_MarkFailed(t *testing.T) {
 		}
 
 		// failed 是终态,不能再被标记成功
-		if ok, err := r.Task.MarkSucceeded(ctx, task.TaskUID); err != nil || ok {
+		if ok, err := r.Task.MarkSucceeded(ctx, task.TaskUID, nil); err != nil || ok {
 			t.Errorf("终态不该被推翻,ok=%v err=%v", ok, err)
 		}
 	})

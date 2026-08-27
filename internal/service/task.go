@@ -119,6 +119,21 @@ func (s *TaskService) notifyCancel(ctx context.Context, taskUID, reason string) 
 	}
 }
 
+// CallbackResult 是一次回调带来的**结果内容**,和状态分开传。
+//
+// 合成一个结构体而不是继续往参数表上加 *string:两个相邻的可空字符串参数
+// 是典型的"传反了编译器也不吭声"的形状,而它们一个是给用户看的答复、
+// 一个是失败原因 —— 弄反了会把报错当成答案显示出来。
+type CallbackResult struct {
+	// ErrorMsg 只在 status=failed 时有意义。
+	ErrorMsg *string
+
+	// Output 只在 status=succeeded 时有意义,是 Agent 的最终答复。
+	// 在此之前这个值是被丢掉的,于是"任务成功了"能查到、
+	// "它到底答了什么"查不到,前端没法做对话界面。
+	Output *string
+}
+
 // HandleCallback 消费 Agent 报上来的任务状态,返回这条回调有没有真的改到行。
 //
 // applied=false 不是错误:任务已经是终态(最常见的是用户抢先取消了),
@@ -129,7 +144,7 @@ func (s *TaskService) notifyCancel(ctx context.Context, taskUID, reason string) 
 // 注意这里没有用户身份可用:调用方是 Agent,不是人。所以这个方法
 // 只能按 taskUID 推进状态,绝不能有任何"按入参当身份"的读写。
 func (s *TaskService) HandleCallback(ctx context.Context, taskUID, status string,
-	errMsg *string) (applied bool, err error) {
+	res CallbackResult) (applied bool, err error) {
 
 	if taskUID == "" {
 		return false, model.ErrTaskNotFound
@@ -139,9 +154,9 @@ func (s *TaskService) HandleCallback(ctx context.Context, taskUID, status string
 	case model.TaskRunning:
 		applied, err = s.repo.Task.MarkRunning(ctx, taskUID)
 	case model.TaskSucceeded:
-		applied, err = s.repo.Task.MarkSucceeded(ctx, taskUID)
+		applied, err = s.repo.Task.MarkSucceeded(ctx, taskUID, res.Output)
 	case model.TaskFailed:
-		applied, err = s.repo.Task.MarkFailed(ctx, taskUID, errMsg)
+		applied, err = s.repo.Task.MarkFailed(ctx, taskUID, res.ErrorMsg)
 	default:
 		// canceled 不在列表里是刻意的:取消只能由用户发起。
 		// 让 Agent 能把任务改成"已取消",等于给一个被攻破的 Agent

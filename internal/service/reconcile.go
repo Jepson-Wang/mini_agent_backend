@@ -143,7 +143,8 @@ func (r *Reconciler) RunOnce(ctx context.Context) (int, error) {
 		// 走 HandleCallback 而不是直接调仓库层。那条路上有三件不能绕开的事:
 		// canceled 白名单、cas(所以一个在我们捞出来之后才完成的任务
 		// 不会被盖成 failed)、以及没生效时的日志。
-		applied, err := r.tasks.HandleCallback(ctx, t.TaskUID, model.TaskFailed, &reason)
+		applied, err := r.tasks.HandleCallback(ctx, t.TaskUID, model.TaskFailed,
+			CallbackResult{ErrorMsg: &reason})
 		if err != nil {
 			// 单个失败不中断整轮:一条坏记录不该让后面几十个都收不掉。
 			slog.Error("回收任务失败",

@@ -18,6 +18,7 @@ import (
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ptr"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/response"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/service"
 )
 
 // 一个合法的 26 位 ULID,和 tasks.task_uid 的 char(26) 对齐。
@@ -44,6 +45,7 @@ type fakeTask struct {
 	gotReason  string
 	gotStatus  string
 	gotErrMsg  *string
+	gotOutput  *string
 	cancelCall int
 }
 
@@ -58,8 +60,11 @@ func (f *fakeTask) Cancel(_ context.Context, userID int64, taskUID, reason strin
 	return f.task, f.err
 }
 
-func (f *fakeTask) HandleCallback(_ context.Context, taskUID, status string, errMsg *string) (bool, error) {
-	f.gotUID, f.gotStatus, f.gotErrMsg = taskUID, status, errMsg
+func (f *fakeTask) HandleCallback(_ context.Context, taskUID, status string,
+	res service.CallbackResult) (bool, error) {
+
+	f.gotUID, f.gotStatus, f.gotErrMsg = taskUID, status, res.ErrorMsg
+	f.gotOutput = res.Output
 	return f.applied, f.err
 }
 

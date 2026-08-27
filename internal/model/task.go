@@ -12,6 +12,16 @@ type Task struct {
 	Input     *string `gorm:"type:text"` // 可空
 	ErrorMsg  *string `gorm:"type:text"` // 可空:成功的任务这里就是 NULL,不是空串
 
+	// Output 是 Agent 跑完给出的最终答复,只有 succeeded 的任务才有。
+	//
+	// 在此之前这个值是**被丢掉的** —— Agent 的 finished 事件里带着它,
+	// 而 TaskEventHandler 只取了状态。于是"任务成功了"能查到,
+	// "它到底答了什么"查不到,任何对话界面都没法做。
+	//
+	// 和 ErrorMsg 一样是可空 text,写入方必须限长(见 service.maxEventOutput):
+	// text 在数据库这边没有上限,而这一列会跟着任务详情回显给用户。
+	Output *string `gorm:"type:text"`
+
 	// CancelReason 是用户点取消时填的理由,可空(没填就是 NULL,不是空串)。
 	// 限长和 dto.CancelTaskReasonReq 的 max 对齐,超了会被 handler 挡在门外。
 	CancelReason *string `gorm:"type:varchar(200)"`

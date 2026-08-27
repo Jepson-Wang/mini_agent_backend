@@ -192,6 +192,7 @@ type statusCall struct {
 	taskUID string
 	status  string
 	errMsg  *string
+	output  *string
 }
 
 // fakeStatusWriter 是 taskStatusWriter 的假实现,用来验事件到状态的映射 ——
@@ -213,9 +214,11 @@ func newFakeStatusWriter() *fakeStatusWriter {
 }
 
 func (f *fakeStatusWriter) HandleCallback(_ context.Context, taskUID, status string,
-	errMsg *string) (bool, error) {
+	res CallbackResult) (bool, error) {
 
-	f.calls = append(f.calls, statusCall{taskUID: taskUID, status: status, errMsg: errMsg})
+	f.calls = append(f.calls, statusCall{
+		taskUID: taskUID, status: status, errMsg: res.ErrorMsg, output: res.Output,
+	})
 	if f.err != nil {
 		return false, f.err
 	}
