@@ -7,6 +7,8 @@
 package service
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -57,7 +59,45 @@ func TestMain(m *testing.M) {
 		}
 		testDB = db
 	}
+	requireDBOrExplicitSkip("service")
 	os.Exit(m.Run())
+}
+
+// allowSkipDBEnv 是"我知道这次不跑数据库用例"的显式承认。
+const allowSkipDBEnv = "ALLOW_SKIP_DB"
+
+// requireDBOrExplicitSkip 在既没有 TEST_DSN、也没有显式承认时直接让本包失败。
+//
+// 这条看着挺凶,但它修的是一个真实的坑:本包大多数用例都要库,没有 TEST_DSN
+// 时它们全被 t.Skip 掉 —— 而 go test 不带 -v 时**不打印 skip,也不打印通过的
+// 包的任何输出**。也就是说"全都跑过了"和"一条都没跑"在终端上都是一行
+//
+//	ok  .../internal/service  0.3s
+//
+// 完全分不出来。想靠打一条醒目的横幅提醒是没用的,那条横幅同样会被吞掉
+// (试过了)。go test 在非 -v 模式下唯一保证会显示的东西,就是失败。
+//
+// 而被静默跳掉的里面有 CLAUDE.md 点名"删了就会出问题"的安全不变量用例:
+// 登录失败不可区分、被禁用账号的校验顺序、取消时别人的任务要看起来像不存在、
+// 迟到的回调不能复活已取消的任务、回调不许写 canceled。这些恰恰是最不该在
+// "看起来是绿的"状态下被跳过的。
+//
+// 所以取向和这个项目里其它地方一致:宁可响亮地拒绝,也不要"能跑但没防护"。
+// 不跑库用例仍然是完全正当的选择,只是得说出来 —— make test 会替你说。
+func requireDBOrExplicitSkip(pkg string) {
+	if testDB != nil || os.Getenv(allowSkipDBEnv) != "" {
+		return
+	}
+	fatal(fmt.Sprintf(`%s 包:没有 TEST_DSN,需要数据库的用例一条都不会跑。
+
+这里拒绝直接给一个 "ok" —— 那和"全部通过"在终端上长得一模一样,
+而被跳掉的用例里包含 CLAUDE.md 点名的安全不变量。
+
+三选一:
+  make test-db                真跑一遍(推荐)
+  make test                   承认跳过,它会替你设 %s=1
+  %s=1 go test ./...   同上,手动版`,
+		pkg, allowSkipDBEnv, allowSkipDBEnv), errors.New("缺少 TEST_DSN"))
 }
 
 // fatal 打一条 ERROR 然后退出。
