@@ -26,7 +26,7 @@ func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
 		"CONFIG_PATH", "ENV_PATH", "APP_ENV", "HTTP_ADDR", "DB_DSN",
-		"AGENT_ADDR", "AGENT_CALLBACK_SECRET", "AGENT_TASK_TIMEOUT",
+		"AGENT_ADDR", "AGENT_CALLBACK_SECRET", "AGENT_GRPC_TOKEN", "AGENT_TASK_TIMEOUT",
 		"AGENT_BREAKER_THRESHOLD", "AGENT_BREAKER_COOLDOWN",
 		"RECONCILE_INTERVAL", "RECONCILE_STALE_AFTER", "RECONCILE_BATCH",
 		"JWT_ISSUER", "JWT_SECRET", "JWT_ACCESS_TTL",
@@ -536,3 +536,138 @@ func TestLoad_ReconcileDisabledSkipsChecks(t *testing.T) {
 		t.Errorf("Reconcile.Interval = %v, 期望 <= 0", cfg.Reconcile.Interval)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// AGENT_GRPC_TOKEN:调 Agent 时带的凭证。和 CallbackSecret 方向相反。
+// ---------------------------------------------------------------------------
+
+// 不填不该拦住启动:Agent 绑在回环地址上(它的默认值)时本来就不鉴权。
+func TestLoad_GRPCTokenOptional(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("缺 AGENT_GRPC_TOKEN 不该阻止启动: %v", err)
+	}
+	if cfg.Agent.Token != "" {
+		t.Errorf("Agent.Token = %q, 期望空", cfg.Agent.Token)
+	}
+}
+
+// 但填了就得够长,理由同 CallbackSecret。
+func TestLoad_ShortGRPCToken(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	short := "tooshort"
+	t.Setenv("AGENT_GRPC_TOKEN", short)
+
+	_, err := Load(writeYAML(t, minimalYAML))
+	if err == nil {
+		t.Fatal("过短的 gRPC 凭证应当报错")
+	}
+	// 这条会进启动日志。
+	if strings.Contains(err.Error(), short) {
+		t.Errorf("错误信息里出现了密钥内容: %v", err)
+	}
+}
+
+// 三把密钥两两不同。共用一个的话,任何一条路径泄露就等于三条全丢 ——
+// 而它们的暴露面完全不一样(JWT 发给每个用户,另外两个只在服务之间走)。
+func TestLoad_GRPCTokenMustDifferFromOtherSecrets(t *testing.T) {
+	other := "another-32-byte-long-secret-value-xx"
+
+	for _, tc := range []struct{ name, jwt, callback, token string }{
+		{"和 JWT_SECRET 相同", testSecret, other, testSecret},
+		{"和 AGENT_CALLBACK_SECRET 相同", testSecret, other, other},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("JWT_SECRET", tc.jwt)
+			t.Setenv("AGENT_CALLBACK_SECRET", tc.callback)
+			t.Setenv("AGENT_GRPC_TOKEN", tc.token)
+
+			_, err := Load(writeYAML(t, minimalYAML))
+			if err == nil {
+				t.Fatal("密钥重复使用应当报错")
+			}
+			if strings.Contains(err.Error(), tc.token) {
+				t.Errorf("错误信息里出现了密钥内容: %v", err)
+			}
+		})
+	}
+}
+
+// 和 JWT.Secret 一样:哪怕有人往 YAML 里写了,也不会被加载进来。
+func TestLoad_GRPCTokenNeverFromYAML(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+
+	// yaml:"-" 的字段在 Strict 模式下是未知字段,写了会直接报错 ——
+	// 这本身就是我们要的:悄悄忽略比报错更糟。
+	_, err := Load(writeYAML(t, minimalYAML+"\nagent:\n  token: leaked-from-yaml\n"))
+	if err == nil {
+		t.Fatal("往 YAML 里写 agent.token 应当被 Strict 模式拒绝")
+	}
+}
+
+// 密钥要走 HTTP 头 / gRPC metadata,非 ASCII 会让每一次调用都在传输层被拒,
+// 而启动时看不出任何异常 —— 必须在配置校验就挡下来。
+//
+// 实测过的失败形态:一个 40 汉字的 AGENT_GRPC_TOKEN(len()=120 字节,长度这关
+// 轻松通过)会让 gRPC 客户端连请求都发不出去,报
+// "Metadata value for key x-agent-token is invalid: Illegal header value",
+// 客户端侧表现为 INTERNAL,日志里没有任何东西指向密钥格式。
+func TestLoad_WireSecretsMustBeASCII(t *testing.T) {
+	const (
+		// 不能和 testSecret 取同一个值 —— 三把密钥必须两两不同,
+		// 否则这条用例会被那条规则拦下,看起来像 ASCII 检查误伤了。
+		ok      = "ZZZZ56789abcdef0123456789abcdefZ"
+		chinese = "密钥密钥密钥密钥密钥密钥密钥密钥密钥密钥"             // 20 字 = 60 字节,长度够
+		spaced  = "0123456789abcdef 0123456789abcde" // 含空格:头部里合法但会被修剪吃掉
+	)
+
+	for _, tc := range []struct{ name, env, val string }{
+		{"回调密钥含中文", "AGENT_CALLBACK_SECRET", chinese},
+		{"gRPC 凭证含中文", "AGENT_GRPC_TOKEN", chinese},
+		{"回调密钥含空格", "AGENT_CALLBACK_SECRET", spaced},
+		{"gRPC 凭证含空格", "AGENT_GRPC_TOKEN", spaced},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("JWT_SECRET", testSecret)
+			t.Setenv(tc.env, tc.val)
+
+			_, err := Load(writeYAML(t, minimalYAML))
+			if err == nil {
+				t.Fatal("非可见 ASCII 的密钥应当在启动时就被拒绝")
+			}
+			// 这条会进启动日志。
+			if strings.Contains(err.Error(), tc.val) {
+				t.Errorf("错误信息里出现了密钥内容: %v", err)
+			}
+		})
+	}
+
+	// 反面:纯 ASCII 的照常放行,别把正常配置也误伤了。
+	t.Run("纯 ASCII 放行", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("JWT_SECRET", testSecret)
+		t.Setenv("AGENT_GRPC_TOKEN", ok)
+		if _, err := Load(writeYAML(t, minimalYAML)); err != nil {
+			t.Fatalf("合法的 ASCII 凭证不该被拒: %v", err)
+		}
+	})
+}
+
+// JWT_SECRET 故意**不**受这条规则约束:它只用来签名,从不出现在任何
+// 头部或 metadata 里,限制它的字符集没有收益,却会打断已有部署。
+func TestLoad_JWTSecretMayBeNonASCII(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", "密钥密钥密钥密钥密钥密钥密钥密钥密钥密钥")
+
+	if _, err := Load(writeYAML(t, minimalYAML)); err != nil {
+		t.Fatalf("JWT_SECRET 允许非 ASCII: %v", err)
+	}
+}
+

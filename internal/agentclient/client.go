@@ -84,6 +84,35 @@ const (
 //	    ("grpc.http2.min_ping_interval_without_data_ms", 10000),
 //	])
 
+// agentTokenMetadataKey 是共享密钥挂的 metadata 键。
+//
+// 必须小写:gRPC 会把 metadata 的 key 统一小写,写成 X-Agent-Token 的话
+// 本地看着对、到线上就和对面的比较对不上。Agent 那侧写死的也是这个小写形式
+// (grpcserver/server.py 的 _AUTH_METADATA_KEY)。
+//
+// 刻意不复用 authorization:那是用户令牌的地盘,理由同
+// middleware.InternalTokenHeader —— 两套凭证混在一个键里,谁顶掉谁很难看出来。
+const agentTokenMetadataKey = "x-agent-token"
+
+// staticToken 把共享密钥挂到每一次 RPC 上。
+//
+// 用 PerRPCCredentials 而不是自己写 interceptor:后者要给 unary 和 stream
+// 各写一个,漏掉 stream 的话最危险的那个方法(RunTask)恰好没带凭证 ——
+// 而它要到部署时才会暴露,本地起个不鉴权的 Agent 一切正常。
+type staticToken struct{ token string }
+
+func (t staticToken) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{agentTokenMetadataKey: t.token}, nil
+}
+
+// RequireTransportSecurity 返回 false:这条连接目前是明文的(见 NewGRPCClient
+// 里的 insecure.NewCredentials)。返回 true 的话 grpc-go 会直接拒绝拨号。
+//
+// 代价要说清楚:明文传输意味着密钥在链路上是裸的。所以这套凭证防的是
+// "谁都能连上这个端口就能跑任意任务",不是"链路被人监听"。
+// 跨主机部署时该走 mTLS 或者把这条链路关进内网/service mesh。
+func (t staticToken) RequireTransportSecurity() bool { return false }
+
 // closeTimeout 关闭时最多等在途的流收多久。
 //
 // 不无限等:一条卡住的流不该让整个进程停不下来。等不及就直接关连接,
@@ -122,8 +151,10 @@ type HealthStatus struct {
 
 // 编译期钉住:GRPCClient 必须满足 Client。
 //
-// 少了这一行,接口和实现漂移了编译器不会吭声 —— 生产代码目前给
-// service 传的是 nil(见 cmd/server/main.go),没有任何一处会做这个赋值。
+// 生产代码确实会做这个赋值(cmd/server/main.go 把 *GRPCClient 传给
+// NewSessionService / NewTaskService),所以漂移了本来也编不过。留着它是为了让
+// 错误出现在**正确的位置**:少了这一行,给 Client 加一个方法会让报错落在
+// cmd/server 和一堆测试文件里,而问题其实在这个包 —— 是它没实现完。
 var _ Client = (*GRPCClient)(nil)
 
 // StartTaskReq 是发起一个任务要的东西。
@@ -277,7 +308,9 @@ func NewGRPCClient(cfg config.Agent, handler EventHandler) (*GRPCClient, error) 
 		return nil, err
 	}
 
-	conn, err := grpc.NewClient(cfg.Addr,
+	// 没配 token 就不挂凭证。这不是"降级放行":Agent 那侧只有绑在回环地址上
+	// 才允许不鉴权,配错的后果是它拒绝启动,不会变成一个静默没防护的服务。
+	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultServiceConfig(`{
 			"loadBalancingPolicy":"round_robin",
@@ -297,7 +330,12 @@ func NewGRPCClient(cfg config.Agent, handler EventHandler) (*GRPCClient, error) 
 			Timeout:             keepaliveTimeout,
 			PermitWithoutStream: keepalivePermitWithoutStream,
 		}),
-	)
+	}
+	if cfg.Token != "" {
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(staticToken{cfg.Token}))
+	}
+
+	conn, err := grpc.NewClient(cfg.Addr, dialOpts...)
 	if err != nil {
 		return nil, err
 	}

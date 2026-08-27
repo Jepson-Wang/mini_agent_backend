@@ -69,6 +69,19 @@ type Agent struct {
 	// 但只要填了,就得够长。
 	CallbackSecret string `yaml:"-"`
 
+	// Token 是**反方向**的共享密钥:本服务调 Agent 的 gRPC 接口时带上它,
+	// 放在 metadata 的 x-agent-token 里。Agent 那侧对应 MINI_AGENT_GRPC_TOKEN。
+	//
+	// 和 CallbackSecret 分开是刻意的,虽然两者都是"服务间凭证":
+	// 它们保护的是两条相反方向的路径,泄露一个不该把另一个也交出去。
+	// 出于同样的理由,它也不能等于 JWT_SECRET。
+	//
+	// 也不是启动必填 —— Agent 绑在回环地址上时不需要鉴权(见它的 serve())。
+	// 但只要填了,就得够长。
+	//
+	// yaml:"-" 的理由和 JWT.Secret 一样:哪怕有人往配置文件里写了也不会被加载。
+	Token string `yaml:"-"`
+
 	// BreakerThreshold 连续多少次"下游有病"就熔断,0 表示不启用熔断。
 	//
 	// 数的是连续失败而不是失败率:这个客户端调用量很低(一次任务一两个 RPC),
@@ -209,6 +222,7 @@ func (c *Config) applyEnv() error {
 	setString(&c.Database.DSN, "DB_DSN")
 	setString(&c.Agent.Addr, "AGENT_ADDR")
 	setString(&c.Agent.CallbackSecret, "AGENT_CALLBACK_SECRET")
+	setString(&c.Agent.Token, "AGENT_GRPC_TOKEN")
 	setString(&c.JWT.Issuer, "JWT_ISSUER")
 	setString(&c.JWT.Secret, "JWT_SECRET")
 
@@ -272,6 +286,38 @@ func setInt(dst *int, env string) error {
 	return nil
 }
 
+// checkWireSecret 校验一把**要在链路上传输**的共享密钥。
+//
+// 长度之外还要卡字符集,理由是这两把密钥都不是"随便什么字节都行"的:
+//   - AGENT_CALLBACK_SECRET 走 HTTP 头 X-Internal-Token;
+//   - AGENT_GRPC_TOKEN 走 gRPC metadata 的 x-agent-token。
+//
+// 两者都只允许 ASCII。塞非 ASCII 进去的后果特别难查:配置校验放行、服务
+// 正常启动,然后**每一次调用**都在传输层就被打回来 —— gRPC 那边是
+// "Illegal header value" + INTERNAL,日志里没有任何东西指向密钥格式。
+//
+// 顺带也让两侧对"多长算够"有同一个答案:Python 那边 len() 数的是字符,
+// Go 这边数的是字节,只要限定 ASCII,两者就恒等。
+//
+// 取 0x21..0x7E(可见字符,不含空格):空格在头部里合法但会被两端的
+// 修剪逻辑吃掉,是另一个同样难查的坑。openssl rand -base64 的输出全在这个范围内。
+func checkWireSecret(name, secret string) error {
+	if len(secret) < minSecretLen {
+		// 不把密钥本身写进错误里 —— 这条会进启动日志。
+		return fmt.Errorf("%s 至少 %d 字节,当前 %d 字节", name, minSecretLen, len(secret))
+	}
+	for i := 0; i < len(secret); i++ {
+		if secret[i] < 0x21 || secret[i] > 0x7E {
+			// 只说位置,不说是什么字符,更不打印整串。
+			return fmt.Errorf(
+				"%s 第 %d 个字节不是可见 ASCII 字符;它要放进 HTTP 头 / gRPC metadata,"+
+					"非 ASCII 会让每一次调用都在传输层被拒。用 openssl rand -base64 48 生成",
+				name, i+1)
+		}
+	}
+	return nil
+}
+
 // Validate 检查配置能不能撑起一次正常启动。
 //
 // 这里宁可启动失败也不给"能跑但不安全"的兜底 ——
@@ -302,13 +348,29 @@ func (c *Config) Validate() error {
 	if c.Agent.TaskTimeout <= 0 {
 		return fmt.Errorf("agent.task_timeout 必须大于 0,当前为 %v", c.Agent.TaskTimeout)
 	}
-	// 空表示不启用 /internal(那组接口会一律 500),但填了就必须够长。
+	// 空表示不启用 /internal(那组接口会一律 500),但填了就必须够长、且可传输。
 	// "填了个 8 位的" 比 "没填" 危险得多:前者会让人以为已经防住了。
-	if s := c.Agent.CallbackSecret; s != "" && len(s) < minSecretLen {
-		return fmt.Errorf("AGENT_CALLBACK_SECRET 至少 %d 字节,当前 %d 字节", minSecretLen, len(s))
+	if s := c.Agent.CallbackSecret; s != "" {
+		if err := checkWireSecret("AGENT_CALLBACK_SECRET", s); err != nil {
+			return err
+		}
 	}
 	if c.Agent.CallbackSecret != "" && c.Agent.CallbackSecret == c.JWT.Secret {
 		return fmt.Errorf("AGENT_CALLBACK_SECRET 不能和 JWT_SECRET 相同")
+	}
+	// 同 CallbackSecret:空表示不带凭证(只在 Agent 绑回环时说得通),填了就得够长、且可传输。
+	if s := c.Agent.Token; s != "" {
+		if err := checkWireSecret("AGENT_GRPC_TOKEN", s); err != nil {
+			return err
+		}
+	}
+	// 三个密钥两两不同。共用一个的话,任何一条路径泄露就等于三条全丢 ——
+	// 而它们的暴露面完全不一样(JWT 发给每个用户,另外两个只在服务之间走)。
+	if c.Agent.Token != "" && c.Agent.Token == c.JWT.Secret {
+		return fmt.Errorf("AGENT_GRPC_TOKEN 不能和 JWT_SECRET 相同")
+	}
+	if c.Agent.Token != "" && c.Agent.Token == c.Agent.CallbackSecret {
+		return fmt.Errorf("AGENT_GRPC_TOKEN 不能和 AGENT_CALLBACK_SECRET 相同")
 	}
 	if c.Agent.BreakerThreshold < 0 {
 		return fmt.Errorf("agent.breaker_threshold 不能为负,当前为 %d(0 表示不启用熔断)",

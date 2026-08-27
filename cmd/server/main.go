@@ -135,6 +135,15 @@ func main() {
 		slog.Warn("未配置 AGENT_CALLBACK_SECRET,/internal 下的接口将一律返回 500")
 	}
 
+	// 反方向的那把密钥。缺了不影响本服务启动 —— Agent 绑在回环上时本来就不鉴权。
+	// 但如果 Agent 是跨主机的,它会自己拒绝启动,那时错误在对面、原因在这边,
+	// 先说一声能省一轮排查。
+	if cfg.Agent.Token == "" {
+		slog.Warn("未配置 AGENT_GRPC_TOKEN,调用 Agent 时不带凭证",
+			"agent_addr", cfg.Agent.Addr,
+			"提示", "仅当 Agent 绑在回环地址上时才成立")
+	}
+
 	if debug {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -168,6 +177,8 @@ func main() {
 			"jwt_issuer", cfg.JWT.Issuer,
 			"jwt_access_ttl", cfg.JWT.AccessTTL.String(),
 			"agent_addr", cfg.Agent.Addr,
+			// 只说带没带凭证,不打密钥,也不打它的长度或指纹。
+			"agent_auth", cfg.Agent.Token != "",
 			"agent_task_timeout", cfg.Agent.TaskTimeout.String(),
 			"agent_breaker_threshold", cfg.Agent.BreakerThreshold,
 			"agent_breaker_cooldown", cfg.Agent.BreakerCooldown.String(),
