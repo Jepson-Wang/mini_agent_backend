@@ -9,13 +9,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 make run        # go run ./cmd/server
 make build      # 产物在 bin/server
-make test       # 不带 DB,需要数据库的用例会跳过
+make test       # 不带 DB(自带 ALLOW_SKIP_DB=1),需要数据库的用例会跳过
 make test-db    # 带 DB,真跑仓库层和 service 层用例
+make test-ci    # 不给逃生口:没有 TEST_DSN 直接红
 make vet        # go vet ./...
 make fmt        # gofmt -l -w .
 ```
 
-跑单个测试（仓库层和 service 层必须给 `TEST_DSN`，否则静默跳过）：
+**裸 `go test ./...` 在没有 `TEST_DSN` 时会让 `repository` 和 `service` 两个包直接失败**，这是刻意的。原因是 `go test` 不带 `-v` 时既不打印 skip、也不打印通过的包的任何输出 —— "52 个用例全被跳过"和"全部通过"输出完全一样，都是一行 `ok`，而被跳掉的里面有下面那份安全不变量清单里的五条。想在没有库的情况下跑，就显式说出来：`make test`（它替你设 `ALLOW_SKIP_DB=1`）。
+
+跑单个测试（仓库层和 service 层必须给 `TEST_DSN`）：
 
 ```bash
 TEST_DSN="host=localhost user=postgres password=123456 dbname=mini_agent_test port=5432 sslmode=disable" \
@@ -106,7 +109,50 @@ repository 数据访问,负责把 gorm/驱动错误翻译成 model.Err*
 - **回收器只写 `failed`，不写 `canceled`**：和上面 Agent 回调那条同一个理由 —— 用户看到是自己取消的，不会去查。
 - **`/internal` 是没有用户身份的路径**：`middleware.InternalAuth` 只能证明"调用方是我们自己的服务"，证明不了它代表谁。所以那个组下面只能有"按资源 ID 推进状态"的接口，**绝不能有拿入参当身份的接口**。密钥用 `subtle.ConstantTimeCompare` 比，漏配时全拒（500），不放行。
 
-对应的测试删了就会出问题：`TestLogin_FailuresAreIndistinguishable`、`TestLogin_DisabledUser`、`TestUserResp_NoEmbeddedStruct`、`TestRegister_ValidationLeaksNothing`、`TestAuth_NilServiceFailsClosed`、`TestCancel_OtherUsersTaskLooksMissing`、`TestCancel_LateCallbackCannotRevive`、`TestHandleCallback_RejectsCanceled`、`TestCallback_RequiresSecret`、`TestCallback_NoSecretConfiguredFailsClosed`、`TestTranslateGRPCError_DropsRawMessage`、`TestHealth_ProbeErrorNotEchoed`、`TestReconcile_NeverWritesCanceled`。
+- **配额链路断在任何一环,表现都是 500**:`TaskQuota` → `ErrTaskQuotaExceeded` → `errRules` → 42900。掉进"没登记 → 50000"的默认分支时,客户端会把它当成"服务坏了"去重试,恰好是超配额时最不该做的事。`TestFailFromError_QuotaExceeded` 盯着这条。
+
+对应的测试删了就会出问题（**打 ★ 的五条没有 `TEST_DSN` 就不会跑**，所以别把 `ALLOW_SKIP_DB=1` 当默认姿势）：★`TestLogin_FailuresAreIndistinguishable`、★`TestLogin_DisabledUser`、`TestUserResp_NoEmbeddedStruct`、`TestRegister_ValidationLeaksNothing`、`TestAuth_NilServiceFailsClosed`、★`TestCancel_OtherUsersTaskLooksMissing`、★`TestCancel_LateCallbackCannotRevive`、★`TestHandleCallback_RejectsCanceled`、`TestCallback_RequiresSecret`、`TestCallback_NoSecretConfiguredFailsClosed`、`TestTranslateGRPCError_DropsRawMessage`、`TestHealth_ProbeErrorNotEchoed`、`TestReconcile_NeverWritesCanceled`、`TestFailFromError_QuotaExceeded`、`TestFailFromError_UnknownErrorLeaksNothing`、`TestLoad_WireSecretsMustBeASCII`、`TestOnEvent_ErrorCarriesOnlyErrorMsg`。
+
+## 任务的最终答复
+
+`tasks.output` 存 Agent 跑完给出的正文,只有 `succeeded` 的任务才有。
+
+在此之前这个值是**被丢掉的**:`finished` 事件的 payload 里带着它,而
+`TaskEventHandler` 只取了状态。结果是"任务成功了"能查到、"它到底答了什么"查不到 ——
+任何对话界面都没法做。现在 `outputFromPayload` 从 payload 里解 `final_response`
+(那个 JSON 由 `grpcserver/server.py` 的 `json.dumps(out)` 拼出来),
+经 `CallbackResult.Output` 落库,再由 `dto.TaskResp.Output` 出去。
+
+三条约定:
+
+- **解不出来不让事件失败**。状态是"成功"这件事比正文更要紧,一起丢掉的话任务会
+  永远停在 `running`,那比"答案没显示出来"糟糕得多。解析失败记一条 Warn。
+- **不拿原始 payload 当答案兜底**。那样用户会看到一坨 JSON。
+- **`output` 和 `error_msg` 互斥**。成功的任务不带错误信息,失败的任务不带正文。
+  混了的话用户会把报错当答案读 —— 这也是这两个值合进 `CallbackResult` 而不是
+  继续往参数表上加 `*string` 的原因:两个相邻的可空字符串参数是典型的
+  "传反了编译器也不吭声"的形状。
+
+`maxEventOutput` 是 64KiB,比 `error_msg` 的 2000 宽得多(这是正文,截短就没法用了),
+但仍然必须有 —— `text` 列在数据库那边没有上限,而这一列会原样回显给用户。
+HTTP 回调那条路由 `dto.TaskCallbackReq.Output` 的 `max` 挡着,两条汇报通道保持等价。
+
+对应的测试:`TestOnEvent_FinishedCarriesFinalResponse`、
+`TestOnEvent_FinishedWithBadPayloadStillSucceeds`、`TestOnEvent_ErrorCarriesOnlyErrorMsg`。
+
+## 任务配额
+
+`service.TaskQuota` 限制单个用户在一个滑动窗口内能建多少任务(默认 200 / 24h,`TASK_QUOTA_MAX=0` 关掉)。**默认是开着的**:默认关掉的话这个开关就成了"知道的人才会去打开"的摆设,而不知道的人正是最需要它的人 —— 每个任务都会驱动一整轮 LLM 循环,不限额等于注册一个号就拿到一张无限额度的卡。Agent 侧的 `IterationBudget` 只挡住单个任务失控,挡不住"一秒建一千个任务"。
+
+三个约定:
+
+- **只在建任务时查**(`CreateWithFirstTask` / `CreateTaskWithSessionID`),取消和查询不查 —— 花钱的是建。
+- **归属校验之后再查配额**。反过来的话,拿别人的 `session_id` 撞一下,就能从"配额超限"和"会话不存在"的差别里判断出这个 ID 真实存在。
+- **数不出来(库报错)就放行**。配额是软限制,而这条路径上的库故障会让紧接着的 `INSERT` 自己失败;在这儿拦下来只会把"建任务失败"变成一个指向错误方向的"配额超限"。
+
+它不是精确锁:两个并发请求可能都读到"还差一个",于是超一个。要精确就得把计数和插入放进同一个事务再锁用户行,为一个防滥用的粗粒度阈值不值得。
+
+`TaskQuota` 收的是 `taskCounter` 接口而不是 `*repository.Repository`(同 `reconcile.go` 的 `staleLister`),所以 `quota_test.go` **不需要 `TEST_DSN`**。这一点是有意的:把一条防滥用规则押在"没有库就会被跳过"的用例上,等于没测。
 
 ## 测试约定
 
@@ -160,6 +206,10 @@ pending ──► running ──┐
 **`PATCH /sessions/:id` 的 `title` 是 `*string` + `required`**：`{}` 和 `{"title":null}` 在 Go 这边都是 nil，分不出"没提这个字段"和"要求清空"，所以两个都拒。清空的写法是 `{"title":""}`。
 
 `AGENT_CALLBACK_SECRET` **不是启动必填**（和 `JWT_SECRET` 不同）：缺了只是 `/internal` 那组接口一律 500，服务其余部分照常。但填了就必须 ≥32 字节，且不能和 `JWT_SECRET` 相同。
+
+**两把要上链路的密钥(`AGENT_CALLBACK_SECRET` / `AGENT_GRPC_TOKEN`)必须是可见 ASCII**(`0x21..0x7E`),由 `config.checkWireSecret` 在启动时挡下。不挡的话失败形态极难查:长度这关轻松通过、服务正常启动、日志一切正常,然后**每一次调用**都在传输层被打回来 —— gRPC 那边是 `Illegal header value` + `INTERNAL`,而错误里没有任何东西指向密钥格式。不含空格是因为空格在头部里合法但会被两端的修剪吃掉。`JWT_SECRET` 不受这条约束:它只用来签名,从不出现在任何头部里。限定 ASCII 顺带也让两侧对"多长算够"有了同一个答案 —— Python 的 `len()` 数字符,Go 的数字节,只有全 ASCII 时两者才恒等。
+
+`AGENT_GRPC_TOKEN` 是**反方向**的那把密钥：`AGENT_CALLBACK_SECRET` 管 Agent 打过来，它管本服务打过去（挂在 gRPC metadata 的 `x-agent-token` 里，Agent 那侧对应 `MINI_AGENT_GRPC_TOKEN`，两边必须一致）。同样不是启动必填 —— Agent 绑在回环地址上时它自己就不鉴权。但填了就必须 ≥32 字节，且**不能和 `JWT_SECRET` 或 `AGENT_CALLBACK_SECRET` 相同**：三把钥匙的暴露面完全不同（JWT 发给每个用户，另外两把只在服务之间走），共用一把等于任何一条路径泄露就全丢。凭证挂在 `PerRPCCredentials` 上而不是自己写 interceptor，是因为后者要给 unary 和 stream 各写一个，漏掉 stream 的话最危险的 `RunTask` 恰好没带凭证，而那要到部署时才暴露。
 
 `AGENT_ADDR`（默认 `localhost:50051`）和 `AGENT_TASK_TIMEOUT`（默认 `30m`）都有默认值，但都会过 `Validate`：空地址、非正的超时一律启动失败。
 
