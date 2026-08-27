@@ -92,7 +92,7 @@ func withSessionSvc(t *testing.T, fn func(t *testing.T, s *SessionService, r *re
 	t.Helper()
 	repo := withTx(t)
 	ag := &fakeAgent{}
-	fn(t, NewSessionService(repo, ag), repo, ag)
+	fn(t, NewSessionService(repo, ag, nil), repo, ag)
 }
 
 // seedUser 建一个用户,返回它的 id。邮箱自动取唯一值。
@@ -120,7 +120,7 @@ func seed(t *testing.T, r *repository.Repository) (userID int64, sess *model.Ses
 	if err != nil {
 		t.Fatalf("建用户: %v", err)
 	}
-	sess, task, err = NewSessionService(r, nil).CreateWithFirstTask(ctx, u.ID,
+	sess, task, err = NewSessionService(r, nil, nil).CreateWithFirstTask(ctx, u.ID,
 		ptr.To("测试会话"), ptr.To("跑一下"))
 	if err != nil {
 		t.Fatalf("建会话和任务失败: %v", err)

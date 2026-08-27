@@ -103,9 +103,19 @@ func main() {
 		}
 	}()
 
+	// 每用户的建任务配额。MaxTasks <= 0 时返回 nil,表示这个部署不限额 ——
+	// SessionService 收 nil 也能正常工作(TaskQuota.Check 是 nil 安全的)。
+	taskQuota, err := service.NewTaskQuota(repo.Task, cfg.Quota)
+	if err != nil {
+		fatal("初始化任务配额失败", err)
+	}
+	if taskQuota == nil {
+		slog.Warn("未启用任务配额(quota.max_tasks <= 0),单个账号可以无限建任务")
+	}
+
 	// SessionService 拿客户端是为了建完任务立刻派发(StartTask),
 	// TaskService 拿它是为了取消时通知(CancelTask)。
-	sessionSvc := service.NewSessionService(repo, agentCli)
+	sessionSvc := service.NewSessionService(repo, agentCli, taskQuota)
 	taskSvc := service.NewTaskService(repo, agentCli)
 
 	// 任务回收器:把没人再会来报结果的任务收尾。
@@ -182,6 +192,8 @@ func main() {
 			"agent_task_timeout", cfg.Agent.TaskTimeout.String(),
 			"agent_breaker_threshold", cfg.Agent.BreakerThreshold,
 			"agent_breaker_cooldown", cfg.Agent.BreakerCooldown.String(),
+			"quota_window", cfg.Quota.Window.String(),
+			"quota_max_tasks", cfg.Quota.MaxTasks,
 			"reconcile_interval", cfg.Reconcile.Interval.String(),
 			"reconcile_stale_after", cfg.Reconcile.StaleAfter.String(),
 		)

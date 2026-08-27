@@ -100,6 +100,13 @@ var errRules = []errRule{
 	// 用 40900 而不是 40000:请求本身没毛病,是资源的状态不允许。
 	{model.ErrTaskNotCancelable, CodeConflict, "任务已经结束,无法取消"},
 
+	// 建任务超出配额。用 42900 而不是 40000:请求本身没毛病,是"现在不行" ——
+	// 同样的请求过一个窗口就会成功,客户端应该退避重试而不是改参数。
+	//
+	// 文案里不带具体数字和窗口长度:那是运营策略,会改,而且逐个探测出来
+	// 对刷量的人是有用信息。真实数字在服务端日志里(TaskQuota.Check 的错误里带着)。
+	{model.ErrTaskQuotaExceeded, CodeQuotaExceeded, "任务创建过于频繁,请稍后再试"},
+
 	// 回调带来的状态不认识。这条基本只会在内部回调接口上出现,
 	// binding 的 oneof 已经挡过一层了。
 	{model.ErrTaskStatusInvalid, CodeInvalidParam, "任务状态不合法"},

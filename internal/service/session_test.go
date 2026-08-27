@@ -68,7 +68,7 @@ func TestCreate_DispatchesAfterCommit(t *testing.T) {
 
 	r := repository.New(testDB) // 不套外层事务
 	ag := &fakeAgent{}
-	s := NewSessionService(r, ag)
+	s := NewSessionService(r, ag, nil)
 
 	userID := seedUser(t, r)
 	t.Cleanup(func() {
@@ -144,7 +144,7 @@ func TestCreate_DispatchFailureMarksTaskFailed(t *testing.T) {
 // 和 TaskService 那边"没接上就只记日志"是同一个取向。
 func TestCreate_NilAgentStillCreates(t *testing.T) {
 	r := withTx(t)
-	s := NewSessionService(r, nil)
+	s := NewSessionService(r, nil, nil)
 	u := seedUser(t, r)
 
 	_, task, err := s.CreateWithFirstTask(context.Background(), u, nil, ptr.To("跑一下"))

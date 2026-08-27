@@ -31,6 +31,7 @@ type Config struct {
 	Server    Server    `yaml:"server"`
 	Database  Database  `yaml:"database"`
 	Agent     Agent     `yaml:"agent"`
+	Quota     Quota     `yaml:"quota"`
 	Reconcile Reconcile `yaml:"reconcile"`
 	JWT       JWT       `yaml:"jwt"`
 }
@@ -94,6 +95,22 @@ type Agent struct {
 	BreakerCooldown time.Duration `yaml:"breaker_cooldown"`
 }
 
+// Quota 限制单个用户在一个时间窗口内能建多少任务。
+//
+// 存在的理由见 service.TaskQuota:每个任务都会驱动一整轮 LLM 循环,
+// 不限额的话注册一个号就等于拿到一张无限额度的卡。
+type Quota struct {
+	// Window 统计窗口,支持 "24h" / "1h" 这种写法。滑动窗口,
+	// 数的是"此刻往前 Window 之内建了几个",不是自然日。
+	Window time.Duration `yaml:"window"`
+
+	// MaxTasks 窗口内的上限。**<= 0 表示不限额。**
+	//
+	// 默认是开着的(见 defaults())。默认关掉的话,这个配置项就成了
+	// "知道的人才会去打开"的摆设,而不知道的人正是最需要它的人。
+	MaxTasks int `yaml:"max_tasks"`
+}
+
 // Reconcile 是任务回收器的参数。
 //
 // 它存在的理由:同步 Agent 只有事件流这一条汇报通道。进程重启、
@@ -141,6 +158,12 @@ func defaults() Config {
 			TaskTimeout:      DefaultAgentTaskTimeout,
 			BreakerThreshold: 5,
 			BreakerCooldown:  30 * time.Second,
+		},
+		Quota: Quota{
+			// 给得很宽松:这道闸防的是脚本按秒刷,不是正常人手速。
+			// 真人一天点两百次对话已经很多了,而一个循环一秒就能打满。
+			Window:   24 * time.Hour,
+			MaxTasks: 200,
 		},
 		Reconcile: Reconcile{
 			Interval:   time.Minute,
@@ -245,6 +268,14 @@ func (c *Config) applyEnv() error {
 		return err
 	}
 	if err := setInt(&c.Reconcile.Batch, "RECONCILE_BATCH"); err != nil {
+		return err
+	}
+	if err := setDuration(&c.Quota.Window, "TASK_QUOTA_WINDOW"); err != nil {
+		return err
+	}
+	// 注意 setInt 对空值是"不覆盖",所以 TASK_QUOTA_MAX=0 是可以关掉配额的
+	// (0 不是空串)。这一点和其它几个"0 表示关掉"的开关一致。
+	if err := setInt(&c.Quota.MaxTasks, "TASK_QUOTA_MAX"); err != nil {
 		return err
 	}
 	return nil
@@ -382,7 +413,21 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("启用熔断时 agent.breaker_cooldown 必须大于 0,当前为 %v",
 			c.Agent.BreakerCooldown)
 	}
+	if err := c.Quota.validate(); err != nil {
+		return err
+	}
 	return c.Reconcile.validate()
+}
+
+// validate 校验配额配置。MaxTasks <= 0 表示不限额,这时窗口随便填。
+func (q Quota) validate() error {
+	if q.MaxTasks <= 0 {
+		return nil
+	}
+	if q.Window <= 0 {
+		return fmt.Errorf("启用配额时 quota.window 必须大于 0,当前为 %v", q.Window)
+	}
+	return nil
 }
 
 // validate 校验回收器配置。Interval <= 0 表示关掉,这时其余字段随便填。

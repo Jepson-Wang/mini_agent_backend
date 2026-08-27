@@ -29,6 +29,7 @@ func clearEnv(t *testing.T) {
 		"AGENT_ADDR", "AGENT_CALLBACK_SECRET", "AGENT_GRPC_TOKEN", "AGENT_TASK_TIMEOUT",
 		"AGENT_BREAKER_THRESHOLD", "AGENT_BREAKER_COOLDOWN",
 		"RECONCILE_INTERVAL", "RECONCILE_STALE_AFTER", "RECONCILE_BATCH",
+		"TASK_QUOTA_WINDOW", "TASK_QUOTA_MAX",
 		"JWT_ISSUER", "JWT_SECRET", "JWT_ACCESS_TTL",
 	} {
 		// 两步走。t.Setenv 是为了登记 cleanup,测试结束把原值还回去;
@@ -671,3 +672,50 @@ func TestLoad_JWTSecretMayBeNonASCII(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// 任务配额
+// ---------------------------------------------------------------------------
+
+// 默认必须是**开着的**。默认关掉的话这个配置项就成了"知道的人才会去打开"的
+// 摆设,而不知道的人正是最需要它的人 —— 一个注册账号无限建任务 = 无限烧额度。
+func TestLoad_QuotaEnabledByDefault(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Quota.MaxTasks <= 0 {
+		t.Fatalf("配额默认应当开启,当前 max_tasks = %d", cfg.Quota.MaxTasks)
+	}
+	if cfg.Quota.Window <= 0 {
+		t.Fatalf("配额窗口必须为正,当前 %v", cfg.Quota.Window)
+	}
+}
+
+// TASK_QUOTA_MAX=0 是关掉配额的正规写法 —— "0" 不是空串,setInt 会真的覆盖。
+func TestLoad_QuotaCanBeDisabledByEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("TASK_QUOTA_MAX", "0")
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("关掉配额不该报错: %v", err)
+	}
+	if cfg.Quota.MaxTasks != 0 {
+		t.Fatalf("max_tasks = %d, 想要 0", cfg.Quota.MaxTasks)
+	}
+}
+
+// 开着配额却给了个非正的窗口 —— 这种配置看着是启用了,实际没法用,必须拦下。
+func TestLoad_QuotaZeroWindowRejected(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("TASK_QUOTA_WINDOW", "0s")
+
+	if _, err := Load(writeYAML(t, minimalYAML)); err == nil {
+		t.Fatal("启用配额时窗口为 0 应当报错")
+	}
+}

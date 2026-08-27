@@ -19,6 +19,12 @@ var (
 	// 告诉他「已经跑完了」不多泄露任何东西。
 	ErrTaskNotCancelable = errors.New("task is not cancelable")
 
+	// ErrTaskQuotaExceeded 用户在配额窗口内建的任务已经到上限。
+	//
+	// 是"稍后再试"而不是"你错了":同样的请求过一个窗口就会成功,
+	// 所以对外走 42900 而不是 400 —— 前者告诉客户端可以退避重试。
+	ErrTaskQuotaExceeded = errors.New("task quota exceeded")
+
 	// ErrTaskStatusInvalid 回调报上来的状态不在我们认识的那几个里。
 	ErrTaskStatusInvalid = errors.New("invalid task status")
 

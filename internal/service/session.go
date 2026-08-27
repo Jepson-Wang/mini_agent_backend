@@ -19,6 +19,10 @@ const listLimitDefault = 20
 type SessionService struct {
 	repo  *repository.Repository
 	agent agentclient.Client
+
+	// quota 可以是 nil(表示这个部署不限额)。Check 是 nil 安全的,
+	// 所以下面两个建任务的方法里不用判空。
+	quota *TaskQuota
 }
 
 // NewSessionService 组装会话服务。
@@ -26,14 +30,23 @@ type SessionService struct {
 // ag 是任务派发用的 Agent 客户端。传 nil 表示这个部署不派发任务:
 // 任务照常建出来,但会一直停在 pending,只记一条 Warn。
 // 和 TaskService 那边同一个取向 —— 库里的记录才是权威,派发是之后的事。
-func NewSessionService(repo *repository.Repository, ag agentclient.Client) *SessionService {
-	return &SessionService{repo: repo, agent: ag}
+// quota 传 nil 表示不限额,见 TaskQuota.Check。
+func NewSessionService(repo *repository.Repository, ag agentclient.Client,
+	quota *TaskQuota) *SessionService {
+
+	return &SessionService{repo: repo, agent: ag, quota: quota}
 }
 
 // CreateWithFirstTask 在一个事务里建会话和它的首个任务,
 // 两个 ID 都在内部生成,调用方不用关心。
 func (s *SessionService) CreateWithFirstTask(ctx context.Context,
 	userID int64, title, input *string) (*model.Session, *model.Task, error) {
+
+	// 配额检查放在最前面:后面每一步都要花钱或者占资源,
+	// 而这一步只是一次走索引的 COUNT。
+	if err := s.quota.Check(ctx, userID); err != nil {
+		return nil, nil, err
+	}
 
 	// 事务里只留数据库操作,ID 先在外面生成好
 	taskUID, err := ulid.New()
@@ -182,6 +195,12 @@ func (s *SessionService) CreateTaskWithSessionID(ctx context.Context, userID int
 	sessionID string, input *string) (*model.Task, error) {
 
 	if _, err := s.mustOwn(ctx, userID, sessionID); err != nil {
+		return nil, err
+	}
+	// 归属校验之后再查配额:配额超限这条信息只该给会话真正的主人。
+	// 反过来的话,拿别人的 session_id 撞一下就能从"配额超限"和"会话不存在"
+	// 的差别里判断出这个 ID 是不是真的存在。
+	if err := s.quota.Check(ctx, userID); err != nil {
 		return nil, err
 	}
 
