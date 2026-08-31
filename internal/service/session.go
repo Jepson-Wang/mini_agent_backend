@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -55,6 +56,9 @@ func (s *SessionService) CreateWithFirstTask(ctx context.Context,
 	}
 
 	var sess *model.Session
+	if input == nil || *input == "" {
+		return nil, nil, errors.New("The input parameter is required")
+	}
 	task := &model.Task{TaskUID: taskUID, UserID: userID, Input: input}
 	err = s.repo.Transaction(ctx, func(r *repository.Repository) error {
 		var err error
