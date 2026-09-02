@@ -67,6 +67,9 @@ type taskStatusWriter interface {
 	// Heartbeat 给正在跑的任务续一次命,防止回收器把它当成卡住的。
 	// 有节流,可以对每条进度事件都调。
 	Heartbeat(ctx context.Context, taskUID string) error
+
+	// IsRunning 给重发那条路判断任务还在不在跑,见 TaskEventHandler.ShouldRetry。
+	IsRunning(ctx context.Context, taskUID string) (bool, error)
 }
 
 // TaskEventHandler 把 Agent 推上来的事件流翻成任务状态。
@@ -184,6 +187,28 @@ func (h *TaskEventHandler) OnStreamError(ctx context.Context, taskUID string, er
 		slog.Info("流中断时任务已是终态,不用收尾",
 			"task_uid", taskUID, "trace_id", traceID)
 	}
+}
+
+// ShouldRetry 回答 agentclient:这个任务的流断了,还值不值得原样重发。
+//
+// 判据只有一条 —— 它还在 running 吗。
+//
+//   - 用户取消了(canceled):重发等于把一个明确叫停的任务重跑一遍。
+//   - 回收器先收了尾(failed):重发跑出来的结果撞上 cas 写不进去,纯浪费。
+//   - 已经成功了(succeeded):流断在 finished 之后,任务本来就完成了。
+//
+// **查不到或者库报错时不重发。** 这条路上判错的两个方向代价不对称:
+// 不重发只是退回原来的行为(标 failed,用户自己重发一次),看得见;
+// 错误地重发是在用户不知情的情况下再烧一轮 LLM,还可能重跑外部工具。
+func (h *TaskEventHandler) ShouldRetry(ctx context.Context, taskUID string, attempt int) bool {
+	running, err := h.tasks.IsRunning(ctx, taskUID)
+	if err != nil {
+		slog.Warn("查不到任务状态,不重发",
+			"task_uid", taskUID, "trace_id", trace.FromContext(ctx),
+			"attempt", attempt+1, "error", err)
+		return false
+	}
+	return running
 }
 
 // truncate 去掉首尾空白并按**字符数**截断,空的返回 nil(对应库里的 NULL)。

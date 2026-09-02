@@ -207,10 +207,21 @@ type fakeStatusWriter struct {
 	touched []string
 	// touchErr 让心跳报错,验它不会把事件处理带崩。
 	touchErr error
+
+	// running / runningErr 驱动 IsRunning,验重发前那道闸门。
+	running    bool
+	runningErr error
 }
 
 func newFakeStatusWriter() *fakeStatusWriter {
 	return &fakeStatusWriter{applied: true} // 默认当作改到了行
+}
+
+// 报错时**照样**返回 running,不返回零值。真仓库当然是返回零值的,
+// 但那样这个假实现就把"报错要不要重发"这件事替被测代码答了 ——
+// ShouldRetry 里那个 if err != nil 删掉用例照样绿。
+func (f *fakeStatusWriter) IsRunning(_ context.Context, _ string) (bool, error) {
+	return f.running, f.runningErr
 }
 
 func (f *fakeStatusWriter) HandleCallback(_ context.Context, taskUID, status string,

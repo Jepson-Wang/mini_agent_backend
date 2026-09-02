@@ -229,8 +229,21 @@ type EventHandler interface {
 	// 一条事件处理失败不该让后面的事件全都收不到。
 	OnEvent(ctx context.Context, ev Event) error
 
-	// OnStreamError 流异常结束。正常结束(EOF)不会走到这里。
+	// OnStreamError 流异常结束、且重试已经用尽。正常结束(EOF)不会走到这里。
+	//
+	// 注意它的语义是"这个任务没救了,收尾吧",不是"某一次流断了" ——
+	// 中途断掉但重发成功的任务不会走到这里。见 runTask。
 	OnStreamError(ctx context.Context, taskUID string, err error)
+
+	// ShouldRetry 在流中断、agentclient 准备重发之前问一次。返回 false 就地收尾。
+	//
+	// **重发的机制在 agentclient,要不要重发是业务决定。** 这个包不读库,
+	// 判断不了任务是不是已经被用户取消了(取消是"先落库、再通知 Agent",
+	// 库里已经是 canceled 了),也判断不了回收器是不是已经先把它收了尾。
+	// 这两种情况下重发都是白烧一轮 LLM:跑出来的结果撞上 cas 也写不进去。
+	//
+	// attempt 从 0 起,是刚刚失败的那一次。
+	ShouldRetry(ctx context.Context, taskUID string, attempt int) bool
 }
 
 // eventTypes 把 proto 的枚举翻成本地类型。
@@ -274,8 +287,13 @@ type GRPCClient struct {
 	handler     EventHandler
 	taskTimeout time.Duration
 	breaker     *breaker.Breaker
-	wg          sync.WaitGroup
-	closing     atomic.Bool
+
+	// retryBackoff 是第一次重发前等的时间,之后按 attempt 翻倍。
+	// 做成字段而不是直接用常量,是为了测试不用真睡几秒。
+	retryBackoff time.Duration
+
+	wg      sync.WaitGroup
+	closing atomic.Bool
 }
 
 // NewGRPCClient 建一个连 Agent 的客户端。
@@ -345,6 +363,8 @@ func NewGRPCClient(cfg config.Agent, handler EventHandler) (*GRPCClient, error) 
 		handler:     handler,
 		taskTimeout: taskTimeout,
 		breaker:     br,
+
+		retryBackoff: retryBaseBackoff,
 	}, nil
 }
 
@@ -407,7 +427,7 @@ func (c *GRPCClient) StartTask(ctx context.Context, req StartTaskReq) error {
 					"task_uid", req.TaskUID, "panic", r, "stack", string(debug.Stack()))
 			}
 		}()
-		c.consume(streamCtx, req.TaskUID, stream)
+		c.runTask(streamCtx, req, stream)
 	}()
 	return nil
 }
@@ -416,7 +436,10 @@ func (c *GRPCClient) StartTask(ctx context.Context, req StartTaskReq) error {
 //
 // 它同时负责给熔断器一次(且仅一次)汇报,理由见 StartTask 上面那段注释。
 func (c *GRPCClient) consume(ctx context.Context, taskUID string,
-	stream agentv1.AgentService_RunTaskClient) {
+	stream agentv1.AgentService_RunTaskClient) streamOutcome {
+
+	// gotEvent 是重试判据的全部依据,见 runTask。
+	gotEvent := false
 
 	// 一次 Allow 对应一次 Record,多记会把半开期的计数搞乱,
 	// 少记会让探针名额漏掉。用一个标志钉死"只记第一次结果"。
@@ -434,18 +457,22 @@ func (c *GRPCClient) consume(ctx context.Context, taskUID string,
 	for {
 		ev, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
-			return
+			return streamOutcome{gotEvent: gotEvent}
 		}
 		if err != nil {
-			// 翻译一次再往外交:handler 会把它写进日志,而 OnStreamError
-			// 的实现方(service)拿到的不该是一串带内网地址的 gRPC 原文。
+			// 翻译一次再往外交:上报方(runTask)会把它交给 OnStreamError,
+			// 而实现方(service)拿到的不该是一串带内网地址的 gRPC 原文。
+			//
+			// 这里**不直接调 OnStreamError**:要不要重发是 runTask 的决定,
+			// 提前上报的话任务就成了终态,重发跑出来的事件会撞上 cas 的
+			// from=[pending,running] 一条都匹配不上,被当成迟到回调静静丢掉。
 			tErr := translateGRPCError("接收任务事件流", err)
 			record(!countsAsUnhealthy(tErr))
-			c.handler.OnStreamError(ctx, taskUID, tErr)
-			return
+			return streamOutcome{err: tErr, gotEvent: gotEvent}
 		}
 		// 收到第一条事件 = 对面确实在干活,这是唯一可信的"健康"证据。
 		record(true)
+		gotEvent = true
 		// Agent 报的 task_uid 应该和我们发过去的一致,不一致说明对面串了 ——
 		// 这时候按我们自己的为准,免得一条事件写到别人的任务上。
 		if ev.TaskUid != taskUID {

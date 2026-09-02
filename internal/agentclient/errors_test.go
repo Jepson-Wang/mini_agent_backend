@@ -112,3 +112,23 @@ func TestCountsAsUnhealthy(t *testing.T) {
 		t.Error("nil 是成功,不该算有病")
 	}
 }
+
+// AlreadyExists 必须有自己的哨兵,不能混进 ErrBadRequest。
+//
+// 它在这条链路上只有一个来源:重发时上一次的 worker 还没散场。
+// 那是**等一下就好**的情况,而 ErrBadRequest 的语义是"重试一万次也一样"。
+// 混在一起的话,重发在最常见的时序下永远失败,而且没有任何迹象。
+func TestSentinelFor_AlreadyExistsIsRetryable(t *testing.T) {
+	err := translateGRPCError("重发任务", status.Error(codes.AlreadyExists, "任务已在运行中"))
+
+	if !errors.Is(err, ErrAlreadyRunning) {
+		t.Errorf("AlreadyExists 翻成了 %v,期望 ErrAlreadyRunning", err)
+	}
+	if errors.Is(err, ErrBadRequest) {
+		t.Error("归到了 ErrBadRequest,重发会被当成'重试也没用'直接放弃")
+	}
+	// 对面健康得很,只是上一次还没散场 —— 别让它去开熔断器。
+	if countsAsUnhealthy(err) {
+		t.Error("算成了'下游有病',一次正常的重发时序就能推动熔断")
+	}
+}

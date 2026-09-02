@@ -243,7 +243,9 @@ pending ──► running ──┐
 
 #### 错误翻译
 
-**gRPC 的 `error` 一步都不许走出 `agentclient`。** `translateGRPCError`（`errors.go`）按状态码归到四个本地哨兵：`ErrUnavailable`（Unavailable / ResourceExhausted）、`ErrTimeout`（DeadlineExceeded）、`ErrBadRequest`（InvalidArgument / NotFound / FailedPrecondition / Unimplemented …）、`ErrRemoteInternal`（Internal / Unknown / DataLoss / 其余）。
+**gRPC 的 `error` 一步都不许走出 `agentclient`。** `translateGRPCError`（`errors.go`）按状态码归到五个本地哨兵：`ErrUnavailable`（Unavailable / ResourceExhausted）、`ErrTimeout`（DeadlineExceeded）、`ErrAlreadyRunning`（AlreadyExists）、`ErrBadRequest`（InvalidArgument / NotFound / FailedPrecondition / Unimplemented …）、`ErrRemoteInternal`（Internal / Unknown / DataLoss / 其余）。
+
+**`AlreadyExists` 单拎一个哨兵，别并回 `ErrBadRequest`。** 它在这条链路上只有一个来源：流断了之后原样重发，而 Agent 那边上一次的 worker 还没散场（`self._tasks.register` 挡回来的）。那是「等一下就好」，而 `ErrBadRequest` 的语义是「重试一万次也一样」。混在一起的话，重发在最常见的时序下每次都失败，而且没有任何迹象。它同样**不算下游有病**——对面健康得很。`TestSentinelFor_AlreadyExistsIsRetryable` 盯着这三条。
 
 翻译结果里**只留 op 和状态码名，绝不带 `status.Message()`**。Unavailable 的 message 长这样：`dial tcp 10.0.0.7:50051: connect: connection refused` —— 里面是内网地址，而这个 error 会经 `OnStreamError` 一路走到 `tasks.error_msg`，那一列是跟着任务详情**回显给用户**的。`TestTranslateGRPCError_DropsRawMessage` 盯着这条。丢掉原文不影响排查：状态码说明了故障类别，Agent 地址启动日志里有一份。
 
@@ -258,6 +260,26 @@ pending ──► running ──┐
 **什么错误算「下游有病」由 `countsAsUnhealthy` 决定，只有 `ErrUnavailable` / `ErrTimeout` / `ErrRemoteInternal` 算。** 把 `InvalidArgument` 这类算进去的话，前端一阵坏请求就能把一个完全健康的 Agent 关在门外。
 
 **`StartTask` 那条路的 `Record` 在 `consume` 里，不在 `StartTask` 里。** `RunTask` 是 server-streaming，`c.cli.RunTask(...)` 不等对面回话就返回 —— Agent 进程没了它照样返回 nil，错误要到第一次 `Recv()` 才浮出来。按它的返回值记账的话，熔断器永远认为下游是好的，装了等于没装，而且没有任何迹象。`consume` 里那个 `recorded` 标志保证一次 `Allow` 只对一次 `Record`：多记会搞乱半开期计数，少记会让探针名额漏掉、熔断器再也回不到 closed。`TestConsume_StreamFailureOpensBreaker` 和 `TestConsume_RecordsExactlyOnce` 盯着这两条。
+
+**每次重发也各自拿一次 `Allow`、还一次 `Record`**（`redial`）。让重发白嫖首发那个名额的话，一个已知连不上的 Agent 会被按 `1 + maxStreamRetries` 倍的流量打——熔断器装了等于没装。`TestRunTask_EachRetryGoesThroughBreaker` 盯着这条。
+
+#### 流中断重试
+
+**gRPC 自带的 `retryPolicy`（`WithDefaultServiceConfig` 里那份）在这条路上基本是摆设。** 透明重试在客户端收到**第一条响应消息**的那一刻就 committed 了，而 `RunTask` 的 `started` 几毫秒就到。所以那份配置只覆盖得了「流根本没建起来」，跑到一半断掉它一次都不会重。真正的重发在 `retry.go` 的 `runTask` 里。
+
+**重发是安全的，因为 Agent 侧本来就是照着「调用方会原样重发」写的。** `run_conversation` 起手三步：`ensure_session`（幂等补 sessions 行）、`recover`（从库里重建历史，顺带按 `tool_call_id` 从幂等表回填已执行工具的真结果补桩）、`_turn_in_flight`（上一轮没跑完就不再重复记用户那句话，直接从补桩后的历史续跑）。所以重发的代价被限制在「崩在哪一步就从哪一步接着跑」，不会从头再烧一遍 LLM，也不会重复执行有副作用的工具。
+
+**钥匙是 `session_id` + `input`，不是 `seq`。** `seq` 在 Agent 那侧是 `itertools.count(1)`，每次 `RunTask` 都从 1 重新数 —— 它是流内序号，不是断点游标。事件不是 Agent 的状态，`messages` 表才是。所以 proto 一个字都不用改。
+
+几条不能改的：
+
+- **判据是「之前收到过事件没有」，不是错误类型**（`streamOutcome.gotEvent`）。流跑到一半断掉，在 gRPC 那层和「压根连不上 Agent」是同一个状态码（`Unavailable`）、同一个哨兵，按错误分不开。但收到过事件就证明 Agent 确实接住了任务并且在跑。一条都没收到 = 交接压根没成功，重发只是拿 N 倍流量去撞一个已知连不上的下游，那是熔断器的活。`TestRunTask_NoEventMeansNoRetry` 盯着这条。
+- **`consume` 绝不自己调 `OnStreamError`**，它只返回 `streamOutcome`。提前上报的话任务就成了终态，重发跑出来的 `started` / `finished` 会撞上 `cas` 的 `from=[pending,running]` 一条都匹配不上，被当成迟到回调**静静丢掉**——你会看到一个成功跑完却显示 `failed` 的任务，而日志里只有一行 INFO。
+- **要不要重发是 service 说的算**（`EventHandler.ShouldRetry` → `TaskEventHandler` → `TaskService.IsRunning`）。`agentclient` 不读库，判断不了任务是不是已经被用户取消了（取消是「先落库、再通知 Agent」，库里已经是 `canceled`），也判断不了回收器是不是先收了尾。查不到或库报错时**不重发**：判错的两个方向代价不对称，不重发只是退回原来的行为（标 `failed`，用户自己重发一次），错误地重发是在用户不知情的情况下再烧一轮 LLM。`TestRunTask_HandlerCanVetoRetry`、`TestShouldRetry_OnlyWhenStillRunning` 盯着这条。
+- **`ErrTimeout` 不重发。** 它自己的注释就写着：超时意味着请求可能已经到对面并且正在执行。而这条路上的超时是 `AGENT_TASK_TIMEOUT`（默认 30m），重两次就是 90 分钟。`TestRunTask_TimeoutIsNotRetried`。
+- **总窗口必须远小于 `RECONCILE_STALE_AFTER`（默认 15m）。** 重发期间任务在库里是 `running` 且 `updated_at` 不动，超过那个窗口回收器会把它标 `failed`，然后重发的结果又被 `cas` 丢掉——和上面「提前上报」是同一个坑，只是换了个人来踩。`maxStreamRetries=2` + `retryBaseBackoff=2s`（按 attempt 翻倍）总共十几秒，所以这条路上不用额外补心跳。
+- **退避的下限是「上一次的 worker 散场」，不是网络抖动。** 流断时 Agent 那边只是被 `context.add_callback` 置了个 cancel 标志，真正 `unregister` 要等 `run_conversation` 走到下一个 `cancel_check`，最坏是一整次 LLM 调用之后。没散场就重发会撞 `ALREADY_EXISTS`（以及 `_SessionLocks` 的会话锁），所以 `retryBaseBackoff` 是 2s 而不是 `retryPolicy` 里那个 0.1s，而且撞上 `ErrAlreadyRunning` 要退避后再来一次，不是就地放弃。`TestRunTask_RetriesWhileAgentStillHoldsTask`。
+- **`error` 事件目前不重发**，只有流中断重发。Agent 报上来的 `error` payload 是纯文本，Go 这边分辨不了「`_SessionBusy`，本任务未执行」（该重试）和「工具参数非法」（重试也一样）。要做准得让 Agent 在 payload 里带一个机器可读的 `retryable` 字段，别在这边猜中文子串。
 
 #### Health
 
@@ -285,9 +307,11 @@ pending ──► running ──┐
 | `finished` | → `succeeded` |
 | `error` | → `failed`，payload 当失败原因 |
 | `thinking` / `tool_call` / `tool_result` / `unknown` | 只记日志，**不写库**（是进度不是状态） |
-| 流中断（`OnStreamError`） | → `failed` |
+| 流中断且**重试已用尽**（`OnStreamError`） | → `failed` |
 
 **流断了必须给任务收尾**，不然它永远停在 `running`。这不会误伤已完成的任务：事件在同一个协程里按序处理，走到 `OnStreamError` 时 `finished` 要么早处理完了（`cas` 落空），要么根本没来过。
+
+注意 `OnStreamError` 对 service 的语义是**「这个任务没救了，收尾吧」，不是「某一次流断了」**——中途断掉但重发成功的任务不会走到这里，见上面的「流中断重试」。它每个任务最多调一次。
 
 所有状态写入都过 `TaskService.HandleCallback`，**别绕开它直接调仓库层** —— `canceled` 白名单、`cas`、迟到回调的日志三件事都在那儿。事件里的失败原因要用 `truncate` 截到 `maxEventErrMsg`（和 `dto.TaskCallbackReq` 的 `max=2000` 对齐）：gRPC 这条路没有 binding tag 挡着，`tasks.error_msg` 又是 text，不截的话对面一条事件就能塞几 MB 进来，而且会跟着任务详情回显给用户。同理，流中断写进 `error_msg` 的文案不能带 gRPC 原文（里面有内网地址和端口）。
 
@@ -304,7 +328,9 @@ pending ──► running ──┐
 - **只写 `failed`，绝不写 `canceled`**。写 `canceled` 用户会以为是自己取消的，一个该被排查的故障就这么藏起来了。
 - **走 `HandleCallback`，不直接调仓库层**。`cas` 在那儿——一个在我们捞出来之后才完成的任务不会被盖成 failed。
 - **单个失败不中断整轮**（`continue`，不 `return`），一条坏记录不该让后面几十个都收不掉。
-- **只收尾，不重跑**。跑了一半的 LLM 任务重跑可能重复扣费、重复调外部工具。要不要重来是用户的决定。
+- **只收尾，不重跑**。要不要重来是用户的决定，不是回收器的。
+
+  这条的原始理由是「跑了一半的 LLM 任务重跑可能重复扣费、重复调外部工具」，而**那个理由现在只成立一半**：Agent 侧的 `recover()` 会按 `tool_call_id` 从幂等表回填已执行工具的真结果补桩，`_turn_in_flight` 会阻止用户那句话被重复记，重跑的代价被限制在崩掉的那一步（见「流中断重试」）。所以这条留着是**因为还没做**，不是因为做不了。要改成重新派发的话，三件事一件都不能少：加一列 `dispatch_attempts` 封顶（否则一个能把 Agent 搞崩的任务会被无限重发，永远烧钱）；认领动作要原子（写成一条带 `dispatch_attempts < ?` 和 `updated_at < ?` 的 UPDATE，靠 `RowsAffected == 1` 仲裁，否则多副本会同时重发同一个任务）；还得给回收器一个 Agent 客户端，而它现在拿的是 `main.go` 里那个**刻意不带客户端**的 `statusWriter`。
 - `ListStale` 的 `limit <= 0` 直接返回空，不是全表 —— GORM 的 `Limit(0)` 是不写 LIMIT 子句，而这跑在后台，真捞了全表也没人会看见。
 
 配套的心跳解决「长任务被误杀」：`TaskEventHandler.OnEvent` 收到进度事件（`thinking` / `tool_call` / `tool_result` / `unknown`）时调 `TaskService.Heartbeat` → `TaskRepo.Touch`，刷一次 `updated_at`。所以 **`stale_after` 要对比的是「Agent 两次事件之间的最长间隔」，不是任务总时长**，一个跑两小时但一直在推进度的任务不会被收掉。改状态的事件不用额外心跳 —— `cas` 那条 UPDATE 本来就刷了 `updated_at`。

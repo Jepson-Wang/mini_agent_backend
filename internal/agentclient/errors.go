@@ -30,6 +30,19 @@ var (
 	// ErrRemoteInternal Agent 自己炸了(Internal / Unknown / DataLoss)。
 	ErrRemoteInternal = errors.New("执行器内部错误")
 
+	// ErrAlreadyRunning Agent 说这个 task_uid 已经在跑了。
+	//
+	// 它只有一个来源:流断了之后原样重发,而上一次的 worker 还没散场。
+	// gRPC 那侧只是给它置了个 cancel 标志(context.add_callback),
+	// 真正 unregister 要等 run_conversation 走到下一个 cancel_check,
+	// 最坏是一整次 LLM 调用之后。
+	//
+	// 单独一个哨兵而不是并进 ErrBadRequest:那一类的语义是"重试一万次
+	// 也一样",而这个是"等一下就好"。混在一起的话,重发在最常见的
+	// 时序下每次都失败,还看不出原因。它同样**不算下游有病** ——
+	// 对面健康得很,只是上一次还没结束。
+	ErrAlreadyRunning = errors.New("执行器上这个任务还没结束")
+
 	// ErrBadRequest Agent 说我们发的东西不对。
 	//
 	// 这一类**不算下游有病**,别让它去开熔断器 —— 否则前端一阵坏请求
@@ -81,7 +94,10 @@ func sentinelFor(code codes.Code) error {
 	case codes.DeadlineExceeded:
 		return ErrTimeout
 
-	case codes.InvalidArgument, codes.NotFound, codes.AlreadyExists,
+	case codes.AlreadyExists:
+		return ErrAlreadyRunning
+
+	case codes.InvalidArgument, codes.NotFound,
 		codes.FailedPrecondition, codes.OutOfRange,
 		codes.PermissionDenied, codes.Unauthenticated:
 		return ErrBadRequest

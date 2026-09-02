@@ -64,5 +64,6 @@ func TestNewGRPCClient_TokenIsOptional(t *testing.T) {
 // NewGRPCClient 拒绝 nil handler,所以这里得给一个。
 type noopHandler struct{}
 
-func (noopHandler) OnEvent(context.Context, Event) error         { return nil }
-func (noopHandler) OnStreamError(context.Context, string, error) {}
+func (noopHandler) OnEvent(context.Context, Event) error          { return nil }
+func (noopHandler) OnStreamError(context.Context, string, error)  {}
+func (noopHandler) ShouldRetry(context.Context, string, int) bool { return false }

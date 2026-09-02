@@ -192,6 +192,23 @@ func (s *TaskService) Heartbeat(ctx context.Context, taskUID string) error {
 	return err
 }
 
+// IsRunning 报告这个任务现在是不是还在 running。
+//
+// 只给重发那条路用(TaskEventHandler.ShouldRetry):流断了要不要原样重发,
+// 取决于这个任务还在不在跑。用户取消过、或者回收器已经先收了尾的话,
+// 重发就是白烧一轮 LLM —— 跑出来的结果撞上 cas 也写不进去。
+//
+// 刻意不判 pending:走到重发这一步说明我们收到过事件,任务早该是 running 了。
+// 还停在 pending 意味着 started 那条 cas 没生效,那是另一个问题,
+// 不该由重发来掩盖。
+func (s *TaskService) IsRunning(ctx context.Context, taskUID string) (bool, error) {
+	t, err := s.repo.Task.GetByUID(ctx, taskUID)
+	if err != nil {
+		return false, err
+	}
+	return t.Status == model.TaskRunning, nil
+}
+
 // logIgnoredCallback 区分"迟到"和"根本不存在"。
 //
 // CAS 分不出这两种(都是 0 行受影响),但运维意义差很远:

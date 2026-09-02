@@ -38,8 +38,18 @@ func (f *fakeStream) Recv() (*agentv1.TaskEvent, error) {
 
 // recordingHandler 记下 consume 交上来的东西。
 type recordingHandler struct {
-	events    []Event
-	streamErr error
+	events         []Event
+	streamErr      error
+	streamErrCalls int
+
+	// vetoRetry 让 ShouldRetry 一律返回 false,模拟"任务已经不是 running 了"。
+	vetoRetry  bool
+	retryAsked int
+}
+
+func (h *recordingHandler) ShouldRetry(_ context.Context, _ string, _ int) bool {
+	h.retryAsked++
+	return !h.vetoRetry
 }
 
 func (h *recordingHandler) OnEvent(_ context.Context, ev Event) error {
@@ -49,6 +59,7 @@ func (h *recordingHandler) OnEvent(_ context.Context, ev Event) error {
 
 func (h *recordingHandler) OnStreamError(_ context.Context, _ string, err error) {
 	h.streamErr = err
+	h.streamErrCalls++
 }
 
 // newConsumeClient 造一个只够跑 consume 的客户端:没有连接,没有 gRPC。
@@ -89,23 +100,28 @@ func ev(seq int64, typ agentv1.EventType) *agentv1.TaskEvent {
 // 所以熔断器只能在这里记账 —— 在 StartTask 里按 RunTask 的返回值记的话,
 // 熔断器会永远认为下游是好的,装了等于没装,而且没有任何迹象。
 func TestConsume_StreamFailureOpensBreaker(t *testing.T) {
-	c, h := newConsumeClient(t, 1) // 一次失败就该打开
+	c, _ := newConsumeClient(t, 1) // 一次失败就该打开
 
 	if !c.breaker.Allow() {
 		t.Fatal("初始状态该放行")
 	}
-	c.consume(context.Background(), consumeUID,
+	out := c.consume(context.Background(), consumeUID,
 		&fakeStream{err: status.Error(codes.Unavailable, "connection refused")})
 
 	if c.breaker.State() != breaker.StateOpen {
 		t.Errorf("流一开头就断,熔断器却是 %v —— 之后每个新任务还会去撞一遍这个死掉的 Agent",
 			c.breaker.State())
 	}
-	if h.streamErr == nil {
-		t.Fatal("没有把流错误交给 handler,任务会永远停在 running")
+	// consume 自己不调 OnStreamError(那是 runTask 的事,它要先决定重不重发),
+	// 但必须把失败原因交出去,否则任务会永远停在 running。
+	if out.err == nil {
+		t.Fatal("没有把流错误报出来,任务会永远停在 running")
 	}
-	if !errors.Is(h.streamErr, ErrUnavailable) {
-		t.Errorf("交给 handler 的错误是 %v,期望翻译过的 ErrUnavailable", h.streamErr)
+	if !errors.Is(out.err, ErrUnavailable) {
+		t.Errorf("报出来的错误是 %v,期望翻译过的 ErrUnavailable", out.err)
+	}
+	if out.gotEvent {
+		t.Error("一条事件都没收到,gotEvent 却是 true —— runTask 会据此去重发")
 	}
 }
 
@@ -131,7 +147,7 @@ func TestConsume_CleanEOFCountsAsHealthy(t *testing.T) {
 	c, h := newConsumeClient(t, 1)
 
 	c.breaker.Allow()
-	c.consume(context.Background(), consumeUID, &fakeStream{
+	out := c.consume(context.Background(), consumeUID, &fakeStream{
 		events: []*agentv1.TaskEvent{
 			ev(1, agentv1.EventType_EVENT_TYPE_STARTED),
 			ev(2, agentv1.EventType_EVENT_TYPE_FINISHED),
@@ -141,8 +157,8 @@ func TestConsume_CleanEOFCountsAsHealthy(t *testing.T) {
 	if c.breaker.State() != breaker.StateClosed {
 		t.Errorf("流正常结束,熔断器却是 %v", c.breaker.State())
 	}
-	if h.streamErr != nil {
-		t.Errorf("EOF 不是错误,不该走 OnStreamError: %v", h.streamErr)
+	if out.err != nil {
+		t.Errorf("EOF 不是错误,不该报出来: %v", out.err)
 	}
 	if len(h.events) != 2 {
 		t.Errorf("交上来 %d 条事件,期望 2 条", len(h.events))

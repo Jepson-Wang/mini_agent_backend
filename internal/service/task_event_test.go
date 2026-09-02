@@ -450,3 +450,33 @@ func TestOnEvent_ErrorCarriesOnlyErrorMsg(t *testing.T) {
 		t.Errorf("失败的任务不该有正文: %q", *c.output)
 	}
 }
+
+// 重发之前那道闸门:任务不在 running 就不重发。
+//
+// 取消是"先落库、再通知 Agent",所以用户点了取消之后库里已经是 canceled,
+// 而 agentclient 不读库、判断不了这件事。这道闸门漏了的话,一个用户
+// 明确叫停的任务会被原样重跑一遍,再烧一轮 LLM。
+func TestShouldRetry_OnlyWhenStillRunning(t *testing.T) {
+	cases := []struct {
+		name    string
+		running bool
+		err     error
+		want    bool
+	}{
+		{name: "还在跑,该重发", running: true, want: true},
+		{name: "已经不是 running(取消/收尾/成功),不重发", running: false, want: false},
+		{name: "库报错时不重发", running: true, err: errors.New("库炸了"), want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newFakeStatusWriter()
+			w.running = tc.running
+			w.runningErr = tc.err
+			h := NewTaskEventHandler(w)
+
+			if got := h.ShouldRetry(context.Background(), evUID, 0); got != tc.want {
+				t.Errorf("ShouldRetry = %v,期望 %v", got, tc.want)
+			}
+		})
+	}
+}
