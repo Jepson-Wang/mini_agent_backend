@@ -205,6 +205,10 @@ pending ──► running ──┐
 
 **`PATCH /sessions/:id` 的 `title` 是 `*string` + `required`**：`{}` 和 `{"title":null}` 在 Go 这边都是 nil，分不出"没提这个字段"和"要求清空"，所以两个都拒。清空的写法是 `{"title":""}`。
 
+**`required` 对 `*string` 只判 nil，不判空串。** validator 的 `hasValue` 撞上指针字段是直接 `return true` 的，所以 `{"input":""}` 能大摇大摆过掉 `required`。`CreateTaskReq.Input` 因此还挂了一个自定义的 `notblank`（`internal/pkg/validate`），把空串和纯空白一起挡在 40000。漏了的话会建出一个 input 为空的任务、原样派给 Agent，驱动一整轮什么都没有的 LLM 循环，还白占一次配额。
+
+`CreateSessionReq.Input` 走的是另一条路：**它可空是刻意的**（先开一个空会话，首轮输入等想好了再发），所以空白输入在 handler 由 `NormalizedInput` 归一成 nil，`CreateWithFirstTask` 那一趟只建会话、不建任务、不派发 —— 不是回 400。把它改成必填之前先想清楚：这是接口契约，不是漏校验。两侧的差别由 `TestCreateTask_RequiresInput` 和 `TestCreateSession_BlankInputCreatesNoTask` 锁着。
+
 `AGENT_CALLBACK_SECRET` **不是启动必填**（和 `JWT_SECRET` 不同）：缺了只是 `/internal` 那组接口一律 500，服务其余部分照常。但填了就必须 ≥32 字节，且不能和 `JWT_SECRET` 相同。
 
 **两把要上链路的密钥(`AGENT_CALLBACK_SECRET` / `AGENT_GRPC_TOKEN`)必须是可见 ASCII**(`0x21..0x7E`),由 `config.checkWireSecret` 在启动时挡下。不挡的话失败形态极难查:长度这关轻松通过、服务正常启动、日志一切正常,然后**每一次调用**都在传输层被打回来 —— gRPC 那边是 `Illegal header value` + `INTERNAL`,而错误里没有任何东西指向密钥格式。不含空格是因为空格在头部里合法但会被两端的修剪吃掉。`JWT_SECRET` 不受这条约束:它只用来签名,从不出现在任何头部里。限定 ASCII 顺带也让两侧对"多长算够"有了同一个答案 —— Python 的 `len()` 数字符,Go 的数字节,只有全 ASCII 时两者才恒等。

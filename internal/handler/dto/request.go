@@ -50,6 +50,7 @@ type LoginReq struct {
 // CreateSessionReq 创建会话。会话和它的首个任务是一起建的(一个事务)。
 //
 // 两个字段都可空:允许先开一个空会话,标题等首轮对话出来再回填。
+// input 为空(或只有空白)时只建会话、不建任务 —— 见 NormalizedInput。
 type CreateSessionReq struct {
 	// max=128 对齐 sessions.title 的 varchar(128)。
 	// Postgres 的 varchar(n) 也按字符算,和 validator 的 max 正好对得上。
@@ -58,6 +59,22 @@ type CreateSessionReq struct {
 	// tasks.input 是 text,数据库自己不设上限,所以必须在入口挡。
 	// 不挡的话一次请求就能往库里塞几 MB,而且它还会跟着任务详情原样发回去。
 	Input *string `json:"input" binding:"omitempty,max=8000"`
+}
+
+// NormalizedInput 返回该建成首个任务的输入。全空白的串归成 nil,
+// 也就是"只开会话、不建任务"。
+//
+// 不这么做的话,{"input":"   "} 会建出一个任务并原样派发给 Agent,
+// 驱动一整轮 LLM 循环 —— 而它手里什么都没有,还白占一次配额。
+// 手法同 NormalizedTitle,但后果比"库里存了个空标题"重得多。
+func (r CreateSessionReq) NormalizedInput() *string {
+	if r.Input == nil {
+		return nil
+	}
+	if s := strings.TrimSpace(*r.Input); s != "" {
+		return &s
+	}
+	return nil
 }
 
 // CancelTaskReasonReq 是取消任务时可选的理由。
@@ -100,8 +117,24 @@ func (r UpdateSessionTitleReq) NormalizedTitle() *string {
 //
 // 这里的 input 是 required,和 CreateSessionReq 不一样:
 // 建空会话说得通(等用户想好再说),建一个没有输入的任务说不通。
+//
+// required 和 notblank 都要写。只写 required 的话这条规矩是空的:
+// Input 是 *string,而 required 对指针只判 nil —— {"input":""} 会直接过,
+// 建出一个空任务派给 Agent 空跑一轮。notblank 补上空串和纯空白两种。
 type CreateTaskReq struct {
-	Input *string `json:"input" binding:"required,max=8000"`
+	Input *string `json:"input" binding:"required,notblank,max=8000"`
+}
+
+// NormalizedInput 返回该写进库的任务输入,去掉首尾空白。
+//
+// 过了 notblank 就不会是 nil,这里仍然判一次:handler 之外还有测试
+// 直接构造这个结构体,少一个 tag 就该是校验失败,不该是空指针。
+func (r CreateTaskReq) NormalizedInput() *string {
+	if r.Input == nil {
+		return nil
+	}
+	s := strings.TrimSpace(*r.Input)
+	return &s
 }
 
 // PageQuery 是列表接口的分页参数,用 form tag 从 query string 里取。

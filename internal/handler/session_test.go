@@ -208,6 +208,33 @@ func TestCreateSession_EmptyBody(t *testing.T) {
 	}
 }
 
+// 建会话这一侧不一样:input 只有空白等于"先开个空会话",
+// 是正常用法而不是坏请求 —— 回 200,但传给 service 的是 nil,
+// 于是那一趟不建任务、不派发。
+func TestCreateSession_BlankInputCreatesNoTask(t *testing.T) {
+	for _, body := range []string{`{"input":""}`, `{"input":"   "}`, `{"title":"订机票","input":"\t\n"}`} {
+		svc := &fakeSession{sess: sampleSession()}
+		w := req(sessionRouter(svc), http.MethodPost, "/api/v1/sessions", body)
+
+		if got := decode(t, w); got.Code != response.CodeOK {
+			t.Fatalf("body=%s: code = %d, body=%s", body, got.Code, w.Body.String())
+		}
+		if svc.gotInput != nil {
+			t.Errorf("body=%s: 该给 service 传 nil,实际 %q", body, *svc.gotInput)
+		}
+	}
+}
+
+// 有正文的话去掉首尾空白再往下传。
+func TestCreateSession_TrimsInput(t *testing.T) {
+	svc := &fakeSession{sess: sampleSession(), task: sampleTask()}
+	req(sessionRouter(svc), http.MethodPost, "/api/v1/sessions", `{"input":"  帮我订张票  "}`)
+
+	if svc.gotInput == nil || *svc.gotInput != "帮我订张票" {
+		t.Errorf("input = %v, 期望去掉首尾空白", svc.gotInput)
+	}
+}
+
 // title 对齐 varchar(128),input 对齐"别让 text 列被塞满"。
 func TestCreateSession_RejectsOversized(t *testing.T) {
 	for _, body := range []string{
@@ -435,8 +462,11 @@ func TestDeleteSession_AlreadyGone(t *testing.T) {
 // ---- /sessions/:id/tasks ----
 
 // 建任务时 input 是必填的:建空会话说得通,建一个没有输入的任务说不通。
+// 空串和纯空白也算没填。required 单独用挡不住它们:Input 是 *string,
+// required 对指针只判 nil —— 少了 notblank 的话 {"input":""} 会一路进到
+// service,建出一个空任务派给 Agent 空跑一轮。
 func TestCreateTask_RequiresInput(t *testing.T) {
-	for _, body := range []string{`{}`, `{"input":null}`} {
+	for _, body := range []string{`{}`, `{"input":null}`, `{"input":""}`, `{"input":"   "}`} {
 		svc := &fakeSession{task: sampleTask()}
 		w := req(sessionRouter(svc), http.MethodPost, "/api/v1/sessions/"+sampleSID+"/tasks", body)
 
@@ -468,6 +498,16 @@ func TestCreateTask_OK(t *testing.T) {
 		if _, ok := data[k]; ok {
 			t.Errorf("响应里出现了 %q: %s", k, w.Body.String())
 		}
+	}
+}
+
+// 正文两侧的空白去掉再往下传:它会跟着进库,也会跟着发给 Agent。
+func TestCreateTask_TrimsInput(t *testing.T) {
+	svc := &fakeSession{task: sampleTask()}
+	req(sessionRouter(svc), http.MethodPost, "/api/v1/sessions/"+sampleSID+"/tasks", `{"input":"  再订一张  "}`)
+
+	if svc.gotInput == nil || *svc.gotInput != "再订一张" {
+		t.Errorf("input = %v, 期望去掉首尾空白", svc.gotInput)
 	}
 }
 

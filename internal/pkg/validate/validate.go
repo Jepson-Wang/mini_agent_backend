@@ -35,6 +35,7 @@ func init() {
 	}
 	v.RegisterTagNameFunc(jsonTagName)
 	_ = v.RegisterValidation("bmax", byteMax)
+	_ = v.RegisterValidation("notblank", notBlank)
 }
 
 // jsonTagName 让校验错误里的字段名跟 JSON 里的一致。
@@ -65,6 +66,25 @@ func byteMax(fl validator.FieldLevel) bool {
 		return false
 	}
 	return len(fl.Field().String()) <= n
+}
+
+// notBlank 是自定义规则 notblank：去掉首尾空白之后不能为空。
+//
+// required 拦不住下面两种，而它们进到业务里的效果和没填一模一样：
+//   - *string 指向空串。required 对指针只判 nil 不 nil（见 validator 的
+//     hasValue：fldIsPointer 时直接 return true），于是 {"input":""} 一路放行。
+//   - 全是空白的串。" " 长度是 1，required 认为"有值"。
+//
+// 这条规则是给 input 这类"会被原样交给 Agent"的字段用的：
+// 一个空 input 照样驱动一整轮 LLM 循环，而它手里什么都没有。
+func notBlank(fl validator.FieldLevel) bool {
+	f := fl.Field()
+	if f.Kind() != reflect.String {
+		// 指针为 nil 时 Kind 是 Ptr，也归到这里 —— 没值当然算空白。
+		// tag 挂到非字符串字段上也走这里：同 byteMax，规则失效必须是显性的。
+		return false
+	}
+	return strings.TrimSpace(f.String()) != ""
 }
 
 // labels 是字段名 → 中文名。
@@ -118,7 +138,9 @@ func message(fe validator.FieldError) string {
 	isText := fe.Kind() == reflect.String
 
 	switch fe.Tag() {
-	case "required":
+	// notblank 和 required 共用一句文案：对用户来说"只填了空格"和"没填"
+	// 是同一件事，分开说反而费解。
+	case "required", "notblank":
 		return name + "不能为空"
 	case "email":
 		return "请填写正确的" + name + "地址"

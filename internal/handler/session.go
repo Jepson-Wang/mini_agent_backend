@@ -61,7 +61,7 @@ func (h *SessionHandler) Create(c *gin.Context) {
 	}
 
 	sess, task, err := h.svc.CreateWithFirstTask(
-		c.Request.Context(), middleware.MustUserID(c), req.Title, req.Input)
+		c.Request.Context(), middleware.MustUserID(c), req.Title, req.NormalizedInput())
 	if err != nil {
 		// ErrSessionExists 故意没登记进 errRules:它意味着 ULID 撞了,
 		// 属于内部故障,对外就是 50000。
@@ -192,7 +192,7 @@ func (h *SessionHandler) CreateTask(c *gin.Context) {
 	}
 
 	task, err := h.svc.CreateTaskWithSessionID(
-		c.Request.Context(), middleware.MustUserID(c), id, req.Input)
+		c.Request.Context(), middleware.MustUserID(c), id, req.NormalizedInput())
 	if err != nil {
 		response.FailFromError(c, err)
 		return

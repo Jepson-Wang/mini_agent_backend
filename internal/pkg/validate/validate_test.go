@@ -106,6 +106,45 @@ func TestByteMax(t *testing.T) {
 	}
 }
 
+// notblank 补 required 的两个洞:*string 指向空串,以及纯空白串。
+// 这两种进到业务里的效果和"没填"一模一样 —— 一个空 input 照样会被
+// 原样交给 Agent,驱动一整轮什么都没有的 LLM 循环。
+func TestNotBlank(t *testing.T) {
+	type ptrSample struct {
+		Input *string `json:"input" binding:"required,notblank"`
+	}
+	sp := func(s string) *string { return &s }
+
+	// 先证明这个洞真的存在。这条断言反过来红了,说明 validator 改了
+	// required 对指针的语义,那时 notblank 才可以考虑撤掉。
+	type onlyRequired struct {
+		Input *string `json:"input" binding:"required"`
+	}
+	if err := binding.Validator.ValidateStruct(&onlyRequired{Input: sp("")}); err != nil {
+		t.Fatalf("前提变了:required 现在能挡住空串了(%v),这条用例该重写", err)
+	}
+
+	for _, bad := range []*string{nil, sp(""), sp("   "), sp("\t\n")} {
+		show := "<nil>"
+		if bad != nil {
+			show = *bad
+		}
+		err := binding.Validator.ValidateStruct(&ptrSample{Input: bad})
+		if err == nil {
+			t.Errorf("input=%q 该被拒", show)
+			continue
+		}
+		// required 和 notblank 共用一句文案:对用户来说是同一件事。
+		if got := Translate(err)["input"]; got != "内容不能为空" {
+			t.Errorf("input=%q 的提示 = %q", show, got)
+		}
+	}
+
+	if err := binding.Validator.ValidateStruct(&ptrSample{Input: sp(" 帮我订张票 ")}); err != nil {
+		t.Errorf("首尾有空白但正文不空,不该被拒: %v", err)
+	}
+}
+
 // 不是校验错误就返回 nil,让调用方回一句笼统的话。
 // 直接吐 json 包的原文会带出 Go 结构体名和字段路径。
 func TestTranslate_NonValidationError(t *testing.T) {

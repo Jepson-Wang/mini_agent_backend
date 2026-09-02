@@ -48,6 +48,41 @@ func TestCreate_DispatchesToAgent(t *testing.T) {
 	})
 }
 
+// input 为 nil 就是"先开一个空会话":会话照建,任务不建,也不派发。
+//
+// 反过来(建一个 input 为空的任务)的后果是它会被原样交给 Agent,
+// 驱动一整轮什么都没有的 LLM 循环,还白占一次配额。
+// 空白串在 handler 那层就已经归成 nil 了(CreateSessionReq.NormalizedInput)。
+func TestCreateWithFirstTask_NoInputCreatesNoTask(t *testing.T) {
+	withSessionSvc(t, func(t *testing.T, s *SessionService, r *repository.Repository, ag *fakeAgent) {
+		ctx := context.Background()
+		u := seedUser(t, r)
+
+		sess, task, err := s.CreateWithFirstTask(ctx, u, ptr.To("标题"), nil)
+		if err != nil {
+			t.Fatalf("CreateWithFirstTask: %v", err)
+		}
+		if sess == nil {
+			t.Fatal("会话还是要建出来的")
+		}
+		if task != nil {
+			t.Errorf("不该建任务,实际拿到 %+v", task)
+		}
+		if len(ag.started) != 0 {
+			t.Errorf("不该派发,实际派了 %d 次", len(ag.started))
+		}
+
+		// 库里也确实没有这个会话的任务。
+		tasks, err := r.Task.ListBySession(ctx, sess.SessionID, 10, 0)
+		if err != nil {
+			t.Fatalf("列任务: %v", err)
+		}
+		if len(tasks) != 0 {
+			t.Errorf("库里有 %d 条任务,期望 0", len(tasks))
+		}
+	})
+}
+
 // 这条是整件事的关键:派发必须发生在事务提交之后。
 //
 // Agent 是同步的,它可能在几毫秒内就把 started 事件推回来,而那条事件

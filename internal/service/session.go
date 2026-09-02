@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 
@@ -49,27 +48,41 @@ func (s *SessionService) CreateWithFirstTask(ctx context.Context,
 		return nil, nil, err
 	}
 
-	// 事务里只留数据库操作,ID 先在外面生成好
-	taskUID, err := ulid.New()
-	if err != nil {
-		return nil, nil, err
+	// input 为 nil 表示"先开一个空会话",这一趟不建任务,也就没什么可派发的。
+	// 空白串在 handler 那层已经被 CreateSessionReq.NormalizedInput 归成 nil ——
+	// 一个空 input 的任务照样会被原样交给 Agent,驱动一整轮什么都没有的 LLM 循环。
+	//
+	// 这里不把它当成坏请求返回错误:接口的契约就是两个字段都可空
+	// (见 dto.CreateSessionReq),建空会话是正常用法。真正必填的是
+	// CreateTaskReq.Input,那条在 handler 用 required,notblank 挡,回 40000。
+	var task *model.Task
+	if input != nil {
+		// 事务里只留数据库操作,ID 先在外面生成好
+		taskUID, err := ulid.New()
+		if err != nil {
+			return nil, nil, err
+		}
+		task = &model.Task{TaskUID: taskUID, UserID: userID, Input: input}
 	}
 
 	var sess *model.Session
-	if input == nil || *input == "" {
-		return nil, nil, errors.New("The input parameter is required")
-	}
-	task := &model.Task{TaskUID: taskUID, UserID: userID, Input: input}
-	err = s.repo.Transaction(ctx, func(r *repository.Repository) error {
+	err := s.repo.Transaction(ctx, func(r *repository.Repository) error {
 		var err error
 		if sess, err = r.Session.Create(ctx, userID, title); err != nil {
 			return err // 已翻译成 ErrUserNotFound / ErrSessionExists
+		}
+		if task == nil {
+			return nil
 		}
 		task.SessionID = sess.SessionID // 会话建出来才知道
 		return r.Task.Create(ctx, task)
 	})
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if task == nil {
+		return sess, nil, nil
 	}
 
 	// 派发放在事务外面,理由见 dispatch 的注释。
