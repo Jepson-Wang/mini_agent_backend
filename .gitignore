@@ -19,3 +19,5 @@ Thumbs.db
 # gRPC 生成代码（protoc/buf 产物，保留目录结构，不追踪生成文件本身）
 *.pb.go
 *_grpc.pb.go
+# 规划文档 / 开发计划：本地笔记，不进仓库
+docs/plans/
