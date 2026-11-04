@@ -18,7 +18,10 @@ import (
 	"github.com/Jepson-Wang/mini_agent_backend/internal/agentclient"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/config"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/handler"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/middleware"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ratelimit"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/redisx"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/token"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/service"
@@ -113,6 +116,59 @@ func main() {
 		slog.Warn("未启用任务配额(quota.max_tasks <= 0),单个账号可以无限建任务")
 	}
 
+	// Redis 只用于限流。redis.addr 为空时 New 返回 (nil, nil),表示不启用。
+	rdb, err := redisx.New(redisx.Options{
+		Addr:     cfg.Redis.Addr,
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
+	})
+	if err != nil {
+		fatal("初始化 Redis 客户端失败", err)
+	}
+	if rdb == nil {
+		slog.Warn("未启用 Redis(redis.addr 为空),登录注册和建任务都没有限流")
+	} else {
+		// 启动时探活,重试几次再放弃。
+		//
+		// 启动期连不上是致命的,运行期出错却是放行(fail open),这是两个不同的时刻:
+		// 启动时地址配错是配置错误,本仓库对配置错误一律大声退出
+		// (缺 JWT_SECRET 就 os.Exit(1),没有"能跑但不安全"的路径);
+		// 运行期的一次抖动则该放行请求,因为口令校验那道防线还在。
+		//
+		// 这与 handler/health.go 里对 Agent 的判断方向相反(Agent 挂了只降级),
+		// 是有意的:那里是运行期的依赖故障,这里是启动期的配置错误。别"统一"它们。
+		readyCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		err := rdb.WaitReady(readyCtx, 3, 1500*time.Millisecond)
+		cancel()
+		if err != nil {
+			fatal("连接 Redis 失败", err)
+		}
+	}
+
+	// ★ 必须用接口类型的变量装,只在 rdb 非 nil 时才赋值。
+	// 把一个值为 nil 的 *ratelimit.Limiter 直接赋给接口字段,得到的接口值
+	// 有类型、无值,不等于 nil —— 路由层的 `d.Limiter != nil` 会判真,
+	// 于是中间件被挂上,运行时才在空指针上炸。
+	var limiter middleware.Limiter
+	// RedisProber 同理:*redisx.Client 的方法虽然 nil 安全,但会把"没启用"报成 up。
+	var redisProber handler.RedisProber
+	if rdb != nil {
+		limiter = ratelimit.New(rdb.Raw())
+		redisProber = rdb
+	}
+
+	rl := cfg.RateLimit
+	authLimits := middleware.AuthLimits{
+		Global:   ratelimit.Rule{Limit: rl.AuthGlobalLimit, Window: rl.AuthGlobalWindow},
+		IP:       ratelimit.Rule{Limit: rl.IPLimit, Window: rl.IPWindow},
+		Email:    ratelimit.Rule{Limit: rl.EmailLimit, Window: rl.EmailWindow},
+		EmailKey: middleware.DeriveEmailKey(cfg.JWT.Secret),
+	}
+	chatLimits := middleware.ChatLimits{
+		Global: ratelimit.Rule{Limit: rl.ChatGlobalLimit, Window: rl.ChatGlobalWindow},
+		User:   ratelimit.Rule{Limit: rl.ChatUserLimit, Window: rl.ChatUserWindow},
+	}
+
 	// SessionService 拿客户端是为了建完任务立刻派发(StartTask),
 	// TaskService 拿它是为了取消时通知(CancelTask)。
 	sessionSvc := service.NewSessionService(repo, agentCli, taskQuota)
@@ -171,6 +227,12 @@ func main() {
 		Verifier:      tokenMgr,
 		InternalToken: cfg.Agent.CallbackSecret,
 		Debug:         debug,
+
+		Limiter:        limiter,
+		AuthLimits:     authLimits,
+		ChatLimits:     chatLimits,
+		TrustedProxies: cfg.Server.TrustedProxies,
+		Redis:          redisProber,
 	})
 
 	srv := &http.Server{
@@ -196,6 +258,13 @@ func main() {
 			"quota_max_tasks", cfg.Quota.MaxTasks,
 			"reconcile_interval", cfg.Reconcile.Interval.String(),
 			"reconcile_stale_after", cfg.Reconcile.StaleAfter.String(),
+			// 只打地址,不打口令,也不打它的长度或指纹。
+			"redis_addr", cfg.Redis.Addr,
+			"rl_auth_global", rl.AuthGlobalLimit, "rl_auth_global_window", rl.AuthGlobalWindow.String(),
+			"rl_ip", rl.IPLimit, "rl_ip_window", rl.IPWindow.String(),
+			"rl_email", rl.EmailLimit, "rl_email_window", rl.EmailWindow.String(),
+			"rl_chat_global", rl.ChatGlobalLimit, "rl_chat_global_window", rl.ChatGlobalWindow.String(),
+			"rl_chat_user", rl.ChatUserLimit, "rl_chat_user_window", rl.ChatUserWindow.String(),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fatal("HTTP 服务异常退出", err)
@@ -220,6 +289,11 @@ func main() {
 
 	if sqlDB, err := db.DB(); err == nil {
 		_ = sqlDB.Close()
+	}
+	// 显式关,不用 defer:顺序要的是「在途请求先做完(上面的 Shutdown),再撤连接池」。
+	// defer 会拖到 main 返回,和前后的关闭动作排不出确定的先后。
+	if err := rdb.Close(); err != nil { // nil 客户端的 Close 返回 nil
+		slog.Error("关闭 Redis 客户端失败", "error", err)
 	}
 	slog.Info("已退出")
 }

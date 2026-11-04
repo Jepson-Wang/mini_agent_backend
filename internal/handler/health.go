@@ -39,13 +39,26 @@ type AgentProber interface {
 	BreakerState() string
 }
 
+// RedisProber 是健康检查需要的 Redis 能力。
+//
+// 同 AgentProber 定在使用方:*redisx.Client 天然满足它,这里不必 import redisx,
+// 测试塞个假的就能跑。
+type RedisProber interface {
+	Ping(ctx context.Context) error
+}
+
+// redisProbeTimeout 探 Redis 等多久。redisx 自己已经有紧超时,
+// 这里再包一层是兜底:/health 被按秒轮询,不能被一个卡住的依赖拖住。
+const redisProbeTimeout = 1 * time.Second
+
 type HealthHandler struct {
 	db    *gorm.DB
 	agent AgentProber
+	redis RedisProber
 }
 
-func NewHealthHandler(db *gorm.DB, agent AgentProber) *HealthHandler {
-	return &HealthHandler{db: db, agent: agent}
+func NewHealthHandler(db *gorm.DB, agent AgentProber, redis RedisProber) *HealthHandler {
+	return &HealthHandler{db: db, agent: agent, redis: redis}
 }
 
 type healthData struct {
@@ -69,6 +82,11 @@ type healthData struct {
 	// agent=up + breaker=open 表示对面已经恢复、再过一个冷却期
 	// 业务也会恢复 —— 这时候去重启服务反而是帮倒忙。
 	Breaker string `json:"breaker,omitempty"`
+
+	// Redis up / down / skipped。
+	// 挂了只降级:Redis 在这里只守着登录注册和建任务的限流,
+	// 它没了是少一层保护,不是业务不可用。
+	Redis string `json:"redis"`
 }
 
 // Check 探活。
@@ -82,6 +100,9 @@ type healthData struct {
 //     登录注册全都正常。这时候回 500 会让 k8s 把所有实例一起重启,
 //     把一个局部故障放大成整站不可用 —— 而重启并不能让 Agent 回来。
 //
+// Redis 同理,也只降级:它没了只是少一层限流保护,登录、会话、任务全都照常,
+// 回 500 会让编排系统重启所有实例,而重启并不能让 Redis 回来。
+//
 // 需要"Agent 不好就别给我流量"的场景(比如灰度切流),
 // 让调用方自己读 agent 字段判断,不要改这里的状态码。
 func (h *HealthHandler) Check(c *gin.Context) {
@@ -89,15 +110,17 @@ func (h *HealthHandler) Check(c *gin.Context) {
 		Status:   statusOK,
 		Database: probeSkipped,
 		Agent:    probeSkipped,
+		Redis:    probeSkipped,
 	}
 
-	// 两个依赖并行探。串行的话最坏要等 pingTimeout + healthTimeout,
+	// 三个依赖并行探。串行的话最坏要把几个超时加起来,
 	// 而 /health 是被按秒轮询的接口 —— 探活本身不该成为负担。
 	var (
 		wg     sync.WaitGroup
 		dbErr  error
 		agentH agentclient.HealthStatus
 		agtErr error
+		rdsErr error
 	)
 
 	if h.db != nil {
@@ -113,6 +136,15 @@ func (h *HealthHandler) Check(c *gin.Context) {
 			defer wg.Done()
 			// agentclient.Health 自己带 healthTimeout,这里不再叠一层。
 			agentH, agtErr = h.agent.Health(c.Request.Context())
+		}()
+	}
+	if h.redis != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(c.Request.Context(), redisProbeTimeout)
+			defer cancel()
+			rdsErr = h.redis.Ping(ctx)
 		}()
 	}
 	wg.Wait()
@@ -145,6 +177,17 @@ func (h *HealthHandler) Check(c *gin.Context) {
 		}
 		if data.Agent != probeUp {
 			data.Status = statusDegraded
+		}
+	}
+
+	if h.redis != nil {
+		if rdsErr != nil {
+			// 原因只进日志:Redis 地址是内网拓扑,/health 通常不鉴权。
+			_ = c.Error(rdsErr)
+			data.Redis = probeDown
+			data.Status = statusDegraded
+		} else {
+			data.Redis = probeUp
 		}
 	}
 

@@ -3,6 +3,8 @@
 package handler
 
 import (
+	"log/slog"
+
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
@@ -47,6 +49,28 @@ type Deps struct {
 	// Debug 打开后会注册 /debug/panic 这类只用于验证的路由。
 	// 生产环境必须是 false。
 	Debug bool
+
+	// Limiter 是限流判定器。传 nil 表示这个部署没启用限流:
+	// 中间件根本不挂载(而不是挂一个空操作),路由行为和没有限流时完全一致。
+	//
+	// 调用方注意:不能把一个值为 nil 的具体指针赋给这个接口字段,
+	// 那样接口本身不是 nil,下面的 nil 判断会失效。
+	Limiter middleware.Limiter
+
+	// AuthLimits 是登录/注册入口的三层限额。Limiter 为 nil 时不用。
+	AuthLimits middleware.AuthLimits
+
+	// ChatLimits 是建任务入口的两层限额。Limiter 为 nil 时不用。
+	ChatLimits middleware.ChatLimits
+
+	// TrustedProxies 是可信反向代理(IP 或 CIDR),交给 gin 的 SetTrustedProxies。
+	// nil 表示谁都不信,ClientIP 只认 RemoteAddr。
+	TrustedProxies []string
+
+	// Redis 给健康检查探 Redis 用。传 nil 则 /health 里 redis 字段是 skipped。
+	//
+	// 探不通只会让 /health 报 degraded,不会 500 —— 理由见 HealthHandler.Check。
+	Redis RedisProber
 }
 
 // NewRouter 装配路由。
@@ -59,6 +83,15 @@ func NewRouter(d Deps) *gin.Engine {
 	// 用 gin.New() 而不是 gin.Default():后者自带 Logger 和 Recovery,
 	// 它们的输出不走我们的统一外壳,会和下面这三个重复。
 	r := gin.New()
+
+	// config.Validate 在启动时已经逐项解析过每个条目,所以走到下面这条日志
+	// 说明有人绕过了配置加载。这里不能把错误吞掉不吭声:SetTrustedProxies 失败时
+	// gin 会退回"谁都不信",而在反向代理后面,所有客户端的 RemoteAddr 都是代理本身,
+	// 于是全部请求会挤进同一个 IP 桶,限流直接误伤全站。
+	// 返回值只有 *gin.Engine,无法把错误往上抛,只能大声记一条。
+	if err := r.SetTrustedProxies(d.TrustedProxies); err != nil {
+		slog.Error("设置可信代理失败,ClientIP 将只认 RemoteAddr", "error", err)
+	}
 
 	// 默认是 false,不开的话 405 会退化成 404。
 	r.HandleMethodNotAllowed = true
@@ -82,15 +115,20 @@ func NewRouter(d Deps) *gin.Engine {
 
 	// ---- 公开路由 ----
 
-	health := NewHealthHandler(d.DB, d.Agent)
+	health := NewHealthHandler(d.DB, d.Agent, d.Redis)
 	r.GET("/health", health.Check)
 
 	api := r.Group("/api/v1")
 
 	// 登录注册这类不需要令牌的接口挂这儿。
-	// 单独开一个组是为了将来往上加限流中间件 —— 撞库和批量注册
+	// 单独开一个组是为了往上挂限流中间件 —— 撞库和批量注册
 	// 只会打这两个接口,限流不该挂到全站。
 	public := api.Group("")
+	// Limiter 为 nil 时一个中间件都不挂,而不是挂一个空操作:
+	// 没启用限流的部署(以及大多数只传了几个 Deps 字段的测试)路由链和从前完全一样。
+	if d.Limiter != nil {
+		public.Use(middleware.AuthRateLimit(d.Limiter, d.AuthLimits))
+	}
 	{
 		auth := NewAuthHandler(d.Auth)
 		public.POST("/auth/register", auth.Register)
@@ -104,12 +142,25 @@ func NewRouter(d Deps) *gin.Engine {
 	{
 		// 会话,以及挂在会话下面的任务。
 		session := NewSessionHandler(d.Session)
-		private.POST("/sessions", session.Create)
+
+		// 建任务限流只挂在会触发 LLM 循环的两条路由上,GET 和取消不限 ——
+		// 与 TaskQuota 同一条规矩:花钱的是建。
+		// 每次调用都返回一个全新的切片:若共用一个切片再 append 末尾的 handler,
+		// 底层数组可能被复用,后一条路由会悄悄覆盖前一条的 handler,
+		// 且只在容量恰好够用时才出现,极难排查。
+		chatChain := func(h gin.HandlerFunc) []gin.HandlerFunc {
+			if d.Limiter == nil {
+				return []gin.HandlerFunc{h}
+			}
+			return []gin.HandlerFunc{middleware.ChatRateLimit(d.Limiter, d.ChatLimits), h}
+		}
+
+		private.POST("/sessions", chatChain(session.Create)...)
 		private.GET("/sessions", session.List)
 		private.GET("/sessions/:id", session.Detail)
 		private.PATCH("/sessions/:id", session.UpdateTitle)
 		private.DELETE("/sessions/:id", session.Delete)
-		private.POST("/sessions/:id/tasks", session.CreateTask)
+		private.POST("/sessions/:id/tasks", chatChain(session.CreateTask)...)
 		private.GET("/sessions/:id/tasks", session.ListTasks)
 
 		// 单个任务。task_uid 全局唯一,所以不挂在 /sessions 下面 ——

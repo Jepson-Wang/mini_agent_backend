@@ -161,3 +161,61 @@ func TestHealth_ProbeErrorNotEchoed(t *testing.T) {
 		}
 	}
 }
+
+// ---- Redis ----
+
+type redisHealthBody struct {
+	Status string `json:"status"`
+	Redis  string `json:"redis"`
+}
+
+func getHealthWithRedis(t *testing.T, p handler.RedisProber) (int, redisHealthBody, string) {
+	t.Helper()
+
+	r := handler.NewRouter(handler.Deps{Redis: p})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	var resp struct {
+		Data redisHealthBody `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v,body=%s", err, w.Body.String())
+	}
+	return w.Code, resp.Data, w.Body.String()
+}
+
+func TestHealth_RedisUp(t *testing.T) {
+	code, body, _ := getHealthWithRedis(t, rlProber{})
+	if code != http.StatusOK || body.Status != "ok" || body.Redis != "up" {
+		t.Errorf("code=%d status=%q redis=%q,期望 200 / ok / up", code, body.Status, body.Redis)
+	}
+}
+
+// Redis 挂了只降级,不 500:它没了只是少一层限流保护,
+// 回 500 会让编排系统重启所有实例,而重启并不能让 Redis 回来。
+func TestHealth_RedisDownIsNot500(t *testing.T) {
+	code, body, _ := getHealthWithRedis(t, rlProber{err: errors.New("connection refused")})
+	if code != http.StatusOK {
+		t.Fatalf("状态码 = %d,期望 200 —— Redis 挂了不该把实例判死", code)
+	}
+	if body.Status != "degraded" || body.Redis != "down" {
+		t.Errorf("status=%q redis=%q,期望 degraded / down", body.Status, body.Redis)
+	}
+}
+
+func TestHealth_NoRedisConfiguredIsSkipped(t *testing.T) {
+	code, body, _ := getHealthWithRedis(t, nil)
+	if code != http.StatusOK || body.Redis != "skipped" || body.Status != "ok" {
+		t.Errorf("code=%d status=%q redis=%q,期望 200 / ok / skipped", code, body.Status, body.Redis)
+	}
+}
+
+func TestHealth_RedisProbeErrorNotEchoed(t *testing.T) {
+	_, _, raw := getHealthWithRedis(t, rlProber{err: errors.New("dial tcp 10.0.0.9:6379: connect: connection refused")})
+	for _, leak := range []string{"10.0.0.9", "6379", "dial tcp"} {
+		if strings.Contains(raw, leak) {
+			t.Errorf("响应体里出现了 %q,Redis 地址是内网拓扑:%s", leak, raw)
+		}
+	}
+}
