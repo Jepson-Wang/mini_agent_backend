@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/emailx"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/hash"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
 )
@@ -147,15 +148,11 @@ func (s *AuthService) issue(u *model.User) (*Credential, error) {
 
 // normalizeEmail 统一邮箱的书写形式。
 //
-// 不做的话 Alice@Example.com 和 alice@example.com 会是两个账号 ——
-// 唯一索引比的是字节,不管大小写。注册和登录必须走同一个函数,
-// 只在其中一边规范化比两边都不做更糟:能注册进去,登录时却找不到。
-//
-// 只小写域名是更严谨的做法(RFC 5321 里 local-part 理论上区分大小写),
-// 但现实中没有邮件服务商这么干,而"大小写不同算两个账号"带来的
-// 客服成本是实打实的。
+// 真正的实现已经挪到 emailx.Normalize:登录限流器的桶键要和这里查库用
+// 同一套规范化,否则换个大小写就能绕过限流。这里留一层薄包装,
+// 是为了让包内的调用点和测试继续用原来的名字。
 func normalizeEmail(email string) string {
-	return strings.ToLower(strings.TrimSpace(email))
+	return emailx.Normalize(email)
 }
 
 // normalizeNickname 去空白;空的返回 nil,对应库里的 NULL。

@@ -15,7 +15,19 @@ const (
 	CodeMethodNotAllowed = 40500 // 请求方法不被支持(NoMethod 兜底用,见 handler.NewRouter)
 	CodeConflict         = 40900 // 和资源当前状态冲突(比如去取消一个已经跑完的任务)
 	CodeQuotaExceeded    = 42900 // 超出配额
-	CodeInternal         = 50000 // 内部错误
+
+	// CodeRateLimited 请求被限流器拦下(登录等入口的频率限制)。
+	//
+	// 排在 42900 后面:同属 429 区间,但 CodeQuotaExceeded 是"建任务的额度用完了",
+	// 这个是"短时间请求太密"。文案刻意不说是哪个维度触发的(IP、邮箱还是全局),
+	// 也不带任何数字和窗口长度:那是运营策略,会改,而且让调用方逐个探测出来
+	// 对刷量的人是有用信息。
+	//
+	// 注意:这个码**没有**对应的 errRules 行,也没有 model.ErrRateLimited。
+	// 限流器是中间件,直接 response.Fail(c, CodeRateLimited, "") 出去,
+	// 不经过 FailFromError,加规则只是死代码,别"补上"。
+	CodeRateLimited = 42901
+	CodeInternal    = 50000 // 内部错误
 
 	// CodeUnavailable 依赖的下游暂时不可用(现在只有 Agent)。
 	//
@@ -42,6 +54,7 @@ var codeText = map[int]string{
 	CodeMethodNotAllowed: "请求方法不被支持",
 	CodeConflict:         "当前状态下无法执行该操作",
 	CodeQuotaExceeded:    "超出配额",
+	CodeRateLimited:      "请求过于频繁,请稍后再试",
 	CodeInternal:         "内部错误",
 	CodeUnavailable:      "服务暂时不可用,请稍后重试",
 	CodeGatewayTimeout:   "服务响应超时,请稍后重试",
