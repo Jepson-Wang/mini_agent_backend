@@ -54,8 +54,10 @@ func (h *AuthHandler) Register(c *gin.Context) {
 
 // Login 处理 POST /api/v1/auth/login。
 //
-// TODO: 这个接口需要限流。没有的话一个脚本可以按每秒几百次的速度撞库,
-// bcrypt 的耗时只是让它慢一点,拦不住。按 IP + 邮箱两个维度都要限。
+// 限流不在这儿,在 middleware.AuthRateLimit 上(挂在 router 的 public 组)。
+// **但只在配了 REDIS_ADDR 的部署里才有** —— 没配的话这个接口就是裸的:
+// 一个脚本可以按每秒几百次的速度撞库,bcrypt 的耗时只是让它慢一点,拦不住。
+// 所以 main.go 在没启用时会打一条 Warn,别把那条 Warn 当噪音划掉。
 func (h *AuthHandler) Login(c *gin.Context) {
 	if !h.ready(c) {
 		return

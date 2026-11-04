@@ -53,6 +53,10 @@ const (
 
 	// failOpenLogEvery 是"限流降级"警告日志的最小间隔。
 	failOpenLogEvery = 10 * time.Second
+
+	// rejectLogEvery 是"限流生效中"汇总日志的最小间隔。
+	// 被拒的速率就是攻击的速率,逐条打日志等于把刷日志的能力也交给攻击者。
+	rejectLogEvery = 10 * time.Second
 )
 
 // DeriveEmailKey 从 JWT_SECRET 派生出一把只用于限流桶键的子密钥。
@@ -114,7 +118,7 @@ func AuthRateLimit(l Limiter, limits AuthLimits) gin.HandlerFunc {
 		// login 和 register 的全局桶故意分开:注册刷量不能把老用户锁在登录之外。
 		if action := lastSegment(c.FullPath()); action != "" {
 			buckets = append(buckets, ratelimit.Bucket{
-				Key: "rl:{login}:global:" + action, Rule: limits.Global, Scope: "global",
+				Key: "rl:{login}:global:" + action, Rule: limits.Global, Scope: "login_global",
 			})
 		}
 
@@ -168,7 +172,7 @@ func ChatRateLimit(l Limiter, limits ChatLimits) gin.HandlerFunc {
 		}
 
 		buckets := []ratelimit.Bucket{
-			{Key: "rl:{chat}:global", Rule: limits.Global, Scope: "global"},
+			{Key: "rl:{chat}:global", Rule: limits.Global, Scope: "chat_global"},
 			{Key: "rl:{chat}:user:" + strconv.FormatInt(uid, 10), Rule: limits.User, Scope: "user"},
 		}
 		admit(c, l, buckets)
@@ -202,13 +206,9 @@ func admit(c *gin.Context, l Limiter, buckets []ratelimit.Bucket) {
 	}
 	c.Header("Retry-After", strconv.FormatInt(secs, 10))
 
-	// 被哪个桶拒的只进日志。三个维度对客户端必须完全一样 —— 同码、同文案、
+	// 被哪个桶拒的只进日志。各个维度对客户端必须完全一样 —— 同码、同文案、
 	// 同头部;也不发 X-RateLimit-Remaining 之类的头,那是给刷量的人看的余额表。
-	slog.Warn("请求被限流",
-		"trace_id", trace.FromGin(c),
-		"scope", res.Scope,
-		"path", c.Request.URL.Path,
-	)
+	recordReject(c, res.Scope)
 	response.Fail(c, response.CodeRateLimited, "")
 }
 
@@ -242,6 +242,68 @@ func recordFailOpen(c *gin.Context, err error) {
 		"trace_id", trace.FromGin(c),
 		"error", err,
 		"fail_open_total", failOpenCount.Load(),
+	)
+}
+
+// rejectCounts 按维度累计被限流拒掉的请求数。
+//
+// 做成 map[string]*atomic.Uint64 而不是一个总数:运维最需要回答的问题是
+// "现在是谁在被拦",而 login_global 被打满(过载/被打)和 email 被打满
+// (有人在撞某个账号)是两件完全不同的事,该触发的告警也不一样。
+//
+// 这张表只在启动时写一次(init 里把所有已知维度建好),之后只读不写,
+// 所以不用加锁 —— 维度是编译期就定下来的常量集合,不会在运行时长出新的。
+var rejectCounts = map[string]*atomic.Uint64{
+	"login_global": new(atomic.Uint64),
+	"ip":           new(atomic.Uint64),
+	"email":        new(atomic.Uint64),
+	"chat_global":  new(atomic.Uint64),
+	"chat_user":    new(atomic.Uint64),
+}
+
+// lastRejectLog 是上次打限流汇总日志的 unix 纳秒,用来节流。
+var lastRejectLog atomic.Int64
+
+// RateLimitRejectCount 返回某个维度累计拒掉的请求数,维度名未知时返回 0。
+// 留给将来的指标接口读取。
+func RateLimitRejectCount(scope string) uint64 {
+	if c, ok := rejectCounts[scope]; ok {
+		return c.Load()
+	}
+	return 0
+}
+
+// recordReject 记一次拒绝。
+//
+// **这里刻意不逐请求打日志**,理由和 recordFailOpen 一样但更要紧:被拒的
+// 速率就是攻击的速率,撞库的时候逐条打 Warn 等于让攻击者顺手把日志刷爆,
+// 真正有用的信息反而被埋掉。
+//
+// 不打也不会丢记录:response.Fail → write 会 c.Set("biz_code", 42901),
+// Logger 中间件本来就会把**每一条**被拒的请求连着 trace_id 记进访问日志。
+// 所以这里只需要一条周期性的汇总,用来回答"现在是哪个维度在被打"。
+func recordReject(c *gin.Context, scope string) {
+	if n, ok := rejectCounts[scope]; ok {
+		n.Add(1)
+	}
+
+	now := time.Now().UnixNano()
+	last := lastRejectLog.Load()
+	if last != 0 && now-last < int64(rejectLogEvery) {
+		return
+	}
+	if !lastRejectLog.CompareAndSwap(last, now) {
+		return // 别的请求抢到了这次日志名额
+	}
+	slog.Warn("限流生效中",
+		"trace_id", trace.FromGin(c),
+		"scope", scope,
+		"path", c.Request.URL.Path,
+		"login_global_total", RateLimitRejectCount("login_global"),
+		"ip_total", RateLimitRejectCount("ip"),
+		"email_total", RateLimitRejectCount("email"),
+		"chat_global_total", RateLimitRejectCount("chat_global"),
+		"chat_user_total", RateLimitRejectCount("chat_user"),
 	)
 }
 

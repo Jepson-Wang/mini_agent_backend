@@ -109,7 +109,7 @@ func TestAuthRateLimit_AllowedPassesThrough(t *testing.T) {
 	if l.n() != 1 {
 		t.Fatalf("Allow 调用 %d 次, 期望 1", l.n())
 	}
-	for _, s := range []string{"global", "ip", "email"} {
+	for _, s := range []string{"login_global", "ip", "email"} {
 		if l.keyOf(t, s) == "" {
 			t.Errorf("缺少 %s 维度的桶", s)
 		}
@@ -283,9 +283,9 @@ func TestAuthRateLimit_LoginAndRegisterHaveSeparateGlobalBuckets(t *testing.T) {
 	l := allow()
 	r := rlEngine(l, testLimits, &reached, nil)
 	post(r, "/api/v1/auth/login", `{"email":"a@b.com"}`)
-	kl := l.keyOf(t, "global")
+	kl := l.keyOf(t, "login_global")
 	post(r, "/api/v1/auth/register", `{"email":"a@b.com"}`)
-	kr := l.keyOf(t, "global")
+	kr := l.keyOf(t, "login_global")
 	if kl != "rl:{login}:global:login" || kr != "rl:{login}:global:register" {
 		t.Fatalf("全局桶键 = %q / %q", kl, kr)
 	}
@@ -332,7 +332,7 @@ func TestChatRateLimit_KeyedByUserID(t *testing.T) {
 	if got := l.keyOf(t, "user"); got != "rl:{chat}:user:42" {
 		t.Fatalf("用户桶键 = %q", got)
 	}
-	if got := l.keyOf(t, "global"); got != "rl:{chat}:global" {
+	if got := l.keyOf(t, "chat_global"); got != "rl:{chat}:global" {
 		t.Fatalf("全局桶键 = %q", got)
 	}
 	if !reached {

@@ -29,6 +29,15 @@ TEST_DSN="host=localhost user=postgres password=123456 dbname=mini_agent_test po
 
 `TEST_DSN` 必须指向单独的测试库（现在是 `mini_agent_test`），**不能指向开发库 `mini_agent_backend`** —— `TestMain` 里会跑 `AutoMigrate` 改表结构。
 
+限流要 Redis。本地起一个：
+
+```bash
+docker run -d -p 6379:6379 redis:7-alpine
+REDIS_ADDR=localhost:6379 make run
+```
+
+**不起也能跑** —— `REDIS_ADDR` 为空就不启用限流（启动时会有一条 Warn）。`make test` 里的限流用例走 miniredis，**不需要任何外部服务**，这一点和 `quota_test.go` 同一个取向：把一条防滥用规则押在"没有服务就会被跳过"的用例上，等于没测。
+
 ## 启动契约
 
 配置四层优先级，后盖前：内置默认值 < `configs/config.yaml` < `.env` < 真实环境变量。
@@ -111,7 +120,7 @@ repository 数据访问,负责把 gorm/驱动错误翻译成 model.Err*
 
 - **配额链路断在任何一环,表现都是 500**:`TaskQuota` → `ErrTaskQuotaExceeded` → `errRules` → 42900。掉进"没登记 → 50000"的默认分支时,客户端会把它当成"服务坏了"去重试,恰好是超配额时最不该做的事。`TestFailFromError_QuotaExceeded` 盯着这条。
 
-对应的测试删了就会出问题（**打 ★ 的五条没有 `TEST_DSN` 就不会跑**，所以别把 `ALLOW_SKIP_DB=1` 当默认姿势）：★`TestLogin_FailuresAreIndistinguishable`、★`TestLogin_DisabledUser`、`TestUserResp_NoEmbeddedStruct`、`TestRegister_ValidationLeaksNothing`、`TestAuth_NilServiceFailsClosed`、★`TestCancel_OtherUsersTaskLooksMissing`、★`TestCancel_LateCallbackCannotRevive`、★`TestHandleCallback_RejectsCanceled`、`TestCallback_RequiresSecret`、`TestCallback_NoSecretConfiguredFailsClosed`、`TestTranslateGRPCError_DropsRawMessage`、`TestHealth_ProbeErrorNotEchoed`、`TestReconcile_NeverWritesCanceled`、`TestFailFromError_QuotaExceeded`、`TestFailFromError_UnknownErrorLeaksNothing`、`TestLoad_WireSecretsMustBeASCII`、`TestOnEvent_ErrorCarriesOnlyErrorMsg`。
+对应的测试删了就会出问题（**打 ★ 的五条没有 `TEST_DSN` 就不会跑**，所以别把 `ALLOW_SKIP_DB=1` 当默认姿势）：★`TestLogin_FailuresAreIndistinguishable`、★`TestLogin_DisabledUser`、`TestUserResp_NoEmbeddedStruct`、`TestRegister_ValidationLeaksNothing`、`TestAuth_NilServiceFailsClosed`、★`TestCancel_OtherUsersTaskLooksMissing`、★`TestCancel_LateCallbackCannotRevive`、★`TestHandleCallback_RejectsCanceled`、`TestCallback_RequiresSecret`、`TestCallback_NoSecretConfiguredFailsClosed`、`TestTranslateGRPCError_DropsRawMessage`、`TestHealth_ProbeErrorNotEchoed`、`TestReconcile_NeverWritesCanceled`、`TestFailFromError_QuotaExceeded`、`TestFailFromError_UnknownErrorLeaksNothing`、`TestLoad_WireSecretsMustBeASCII`、`TestOnEvent_ErrorCarriesOnlyErrorMsg`、`TestAllow_NarrowBucketRejectDoesNotConsumeGlobal`、`TestAllow_FixedWindowBoundaryBurstIsRejected`、`TestAllow_SameMillisecondAttemptsAllCount`、`TestAllow_ZeroLimitBucketIsSkipped`、`TestAllow_RetryAfterIsWindowNotRemaining`、`TestAuthRateLimit_OversizedBodyIsRejected`、`TestAuthRateLimit_UsesRemoteAddrNotXFF`、`TestAuthRateLimit_RejectionDoesNotRevealDimension`、`TestAuthRateLimit_EmailKeyIsHMACNotPlaintext`、`TestChatRateLimit_MissingUserIDFailsClosed`、`TestLogin_RateLimitedResponseIsIdenticalForUnknownEmail`、`TestNew_SetsExplicitTimeouts`、`TestHealth_RedisProbeErrorNotEchoed`。
 
 ## 任务的最终答复
 
@@ -153,6 +162,161 @@ HTTP 回调那条路由 `dto.TaskCallbackReq.Output` 的 `max` 挡着,两条汇�
 它不是精确锁:两个并发请求可能都读到"还差一个",于是超一个。要精确就得把计数和插入放进同一个事务再锁用户行,为一个防滥用的粗粒度阈值不值得。
 
 `TaskQuota` 收的是 `taskCounter` 接口而不是 `*repository.Repository`(同 `reconcile.go` 的 `staleLister`),所以 `quota_test.go` **不需要 `TEST_DSN`**。这一点是有意的:把一条防滥用规则押在"没有库就会被跳过"的用例上,等于没测。
+
+## 限流
+
+登录注册和建任务三条路都挂了基于 Redis 的滑动窗口限流（`internal/pkg/ratelimit`）。
+**`REDIS_ADDR` 为空 = 这一层不启用**，服务其余部分照常跑，启动时会打一条 Warn。
+
+### 三种控制回答三个不同的问题
+
+| 控制 | 回答的问题 | 在哪 |
+|---|---|---|
+| `TaskQuota` | **总共**能建多少（200 / 24h） | `service/quota.go` |
+| 限流 | **多久来一个** | `middleware/ratelimit.go` |
+| 并发信号量 | **同时几个在跑** | **还没做** |
+
+**这三样不能互相替代。** 所以「限流能不能保护 Agent」的诚实答案是：它挡得住突发脚本，
+挡不住「稳定 2/s 持续半小时 = 3600 个并发任务」。`agentclient` 那侧至今没有并发上限
+（`client.go` 只有一个 `sync.WaitGroup`），每个 `StartTask` 无条件起一个 goroutine
+持一条 gRPC 流最长 30 分钟。要管并发得上信号量，那是另一件事。
+
+### 五个桶
+
+| key | 默认 | 它在防什么 |
+|---|---|---|
+| `rl:{login}:global:<action>` | 10 / 1s，login 和 register **各一个** | 过载保护，**不是安全措施** |
+| `rl:{login}:ip:<ip>` | 30 / 60s | 拦单机的脑死流量 |
+| `rl:{login}:email:<hmac>` | 5 / 60s | 拦撞库 —— 真正起作用的那一层 |
+| `rl:{chat}:global` | 5 / 1s | 挡突发脚本 |
+| `rl:{chat}:user:<user_id>` | 10 / 60s | 单账号的速率上限 |
+
+几条不能改的：
+
+- **全局闸是过载保护，不是安全措施。** `hash.DefaultCost = 12`，一次 bcrypt 约 160ms，
+  所以 50/s × 160ms = 每秒 8 个 CPU 秒 —— 服务器会在远没到 50/s 之前先趴下，那道闸
+  永远不触发。定在 10/s 它才真的生效。**代价要说清楚**：攻击者换约 120 个 IP 就能持续
+  打满它，让所有人登不进去。但没有这道闸的话同样的流量直接把 bcrypt 打爆，连会话和
+  任务接口一起死 —— 有它是「快速 429」，没它是「整站超时」。
+  **别写「两层互相保护」，那是过度声称。**
+- **IP 的 30/60s 必须比邮箱的 5/60s 高一个数量级。** 两个维度防的不是一回事。拿邮箱的
+  阈值去卡 IP，一个公司/学校的 NAT 出口（整栋楼共用一个 IP）会被整体误伤。
+- **`register` 和 `login` 各一个全局桶**，不共用。共用的话一轮注册洪水会把已有用户的
+  登录一起锁死，而登录的可用性比注册重要得多。代价是 bcrypt 的总负载上限是 20/s 而
+  不是 10/s，这是刻意换的。
+- **只在「建」的路由上挂 chat 限流**（`POST /sessions`、`POST /sessions/:id/tasks`），
+  GET 和 cancel 不挂 —— 同 `TaskQuota`「花钱的是建」。
+
+### 为什么必须是 Lua
+
+一次判定是 `ZREMRANGEBYSCORE` → `ZCARD` → **如果没满**才 `ZADD`。中间那个「如果」
+决定了它不能用 `MULTI/EXEC`：事务不能根据前一条命令的结果分支，命令是一次性排队、
+一次性执行的。Pipeline 只是把多个往返合成一个，**不保证原子性**，两个并发请求会都
+读到「还差一个」。只剩 Lua：Redis 单线程跑完整个脚本，期间插不进别的命令。
+
+对照固定窗口（`INCR` + `EXPIRE`）：边界允许 2 倍突发 —— 第 1 秒的最后 1 毫秒打满，
+第 2 秒的第 1 毫秒再打满。`TestAllow_FixedWindowBoundaryBurstIsRejected` 盯着这条，
+它是整个设计选滑动窗口的全部理由。
+
+### 脚本里三条不能动的
+
+- **两遍循环：第一遍只判定，第二遍才记账。** 边查边写的话，一个被窄桶拒掉的请求会
+  先把全局桶记一账 —— 攻击者维持住速率就能占满全局名额，让所有人被拒，而日志上看
+  全是「正常拦截」。限流器自己成了 DoS 放大器。
+  `TestAllow_NarrowBucketRejectDoesNotConsumeGlobal` 盯着这条。
+- **时钟只有 Redis 的 `TIME`，不从 Go 传。** `ZREMRANGEBYSCORE` 是对共享状态的**删除**，
+  由 Go 传时间的话一个快钟副本会删掉其他副本还认为在窗口内的成员，**全集群静默失效**。
+  `TIME` 在 Redis 5 之后的脚本里合法（效果复制），不需要 `redis.replicate_commands()`。
+  测试侧用 `miniredis.SetTime` 控时钟。
+- **成员名必须带唯一后缀。** ZSET 的成员会去重，同一毫秒两个请求用同样的成员名，第二次
+  `ZADD` 只是更新 score，`ZCARD` 不变 —— **一次尝试凭空消失**。
+  `TestAllow_SameMillisecondAttemptsAllCount` 盯着这条。
+
+### `TRUSTED_PROXIES` —— 不配它，IP 那一层等于没做
+
+`c.ClientIP()` 默认信任 `X-Forwarded-For`，而 **gin 默认信任所有代理**
+（`trustedProxies: ["0.0.0.0/0", "::/0"]`）。不配的话攻击者每个请求伪造一个新 IP，
+IP 桶永远打不满。`NewRouter` 里 `SetTrustedProxies(d.TrustedProxies)`，**默认 nil =
+谁都不信，`ClientIP()` 退回 socket 对端**。
+
+每一项都在 `config.Validate` 里解析校验过，因为 `NewRouter` 里那个 error 没法往外抛 ——
+吞掉的话一个拼错的 `TRUSTED_PROXIES` 会静默变成「谁都不信」，放到 nginx 后面时
+**所有客户端塌缩成同一个 IP 桶**，限流变成全站共享一个额度，而且没有任何迹象。
+
+顺带：`middleware.Logger` 已经在调 `c.ClientIP()`，所以放到代理后面时访问日志也会
+开始记网关 IP —— 配好 `TRUSTED_PROXIES` 两处一起恢复。
+
+### fail-open / fail-closed 在这条链路上是分开的
+
+| 情况 | 行为 | 理由 |
+|---|---|---|
+| 没配 `REDIS_ADDR` | 中间件压根不挂 | 合法的部署选择，启动 Warn 兜住 |
+| Redis 运行时报错 / 超时 | **放行**，计数 | 限流拦滥用，而口令校验那道防线还在。fail-closed 会让一次 Redis 抖动变成全站登不进去 |
+| 启动时 Ping 不通 | **重试 3 次后 `os.Exit(1)`** | 启动时拨不通通常是配错，同 `JWT_SECRET` 缺失。重试是为了别让一次抖动变成 CrashLoopBackOff |
+| `ChatRateLimit` 取不到 `user_id` | **500，fail closed** | 那只意味着这条路由忘了挂 `Auth`，是接线 bug，不是依赖不可用 |
+
+**后两行方向相反，而且必须相反。** 把「这个部署没启用防护」和「代码接错了」混成同一个
+分支，就是把一个 bug 伪装成一个配置。
+
+### 两个和安全直接相关的实现细节
+
+- **邮箱进 key 之前要过 HMAC，不是裸 sha256。** Redis 的 key 会出现在 `SLOWLOG`、
+  `MONITOR`、监控面板里，而邮箱是 PII。裸 sha256 **不构成去标识化** —— 邮箱地址空间
+  可枚举，拿一本字典就能反查。用 `HMAC-SHA256(subkey, emailx.Normalize(email))`，
+  `subkey = HMAC-SHA256(JWT_SECRET, "mini-agent:ratelimit:email")`，标准密钥分离，
+  不需要新配置项，也不让 `JWT_SECRET` 本身出现在任何 key 里。
+- **超长 body 必须拒绝，不能「跳过邮箱桶然后放过去」。** `AuthRateLimit` 要读 body 才能
+  拿到邮箱，而 dto 没开 `DisallowUnknownFields` —— 塞一个 4KB 的垃圾字段照样能绑定成功、
+  照样登录。放过去等于攻击者用一个字节数就关掉了唯一一层定向防护。合法的 auth body
+  不到 1KB。`TestAuthRateLimit_OversizedBodyIsRejected` 盯着这条。
+
+### 已知取舍
+
+- **统计的是尝试，不是失败。** 「只统计失败的登录」要在 `c.Next()` 之后按状态码回写，
+  会把原子的「查+记」拆成两半。代价是**别人可以用你的邮箱把你的桶打满，让你一分钟内
+  登不进去**。这是真实存在的，不装作没有。
+- **`Retry-After` 回的是固定的窗口长度，不是精确剩余时间。** 精确值会泄露「桶里最早那次
+  尝试发生在什么时候」，而邮箱桶是攻击者和账号主人共享的 —— 那等于从一个免鉴权接口
+  读出受害者上次登录的时刻。
+- **不回 `X-RateLimit-Remaining`**：那是给攻击者一张精确的余额表。
+- **拒绝时不透露是哪个桶拦的** —— 同一个码、同一句文案、同一组头部。区分开攻击者就
+  知道该换 IP 还是换邮箱。`Scope` 只进日志和指标。
+
+### 配置项
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `REDIS_ADDR` | 空 | **空 = 不启用限流** |
+| `REDIS_PASSWORD` | 空 | 只从环境变量读，`yaml:"-"` |
+| `REDIS_DB` | 0 | |
+| `RATELIMIT_AUTH_GLOBAL_LIMIT` / `_WINDOW` | 10 / 1s | 0 = 关掉这一层 |
+| `RATELIMIT_IP_LIMIT` / `_WINDOW` | 30 / 1m | 同上 |
+| `RATELIMIT_EMAIL_LIMIT` / `_WINDOW` | 5 / 1m | 同上 |
+| `RATELIMIT_CHAT_GLOBAL_LIMIT` / `_WINDOW` | 5 / 1s | 同上 |
+| `RATELIMIT_CHAT_USER_LIMIT` / `_WINDOW` | 10 / 1m | 同上 |
+| `TRUSTED_PROXIES` | 空 | 逗号分隔的 IP/CIDR。**空 = 谁都不信** |
+
+**五层全是 0 会被 `Validate` 拒掉**：那是「看起来启用了实际什么都没做」，和
+`BreakerThreshold > 0 && BreakerCooldown <= 0` 被拒是同一个理由。
+
+### 不能删的测试（追加到现有清单）
+
+`TestAllow_NarrowBucketRejectDoesNotConsumeGlobal`、
+`TestAllow_FixedWindowBoundaryBurstIsRejected`、
+`TestAllow_SameMillisecondAttemptsAllCount`、
+`TestAllow_ZeroLimitBucketIsSkipped`、
+`TestAllow_RetryAfterIsWindowNotRemaining`、
+`TestAuthRateLimit_OversizedBodyIsRejected`、
+`TestAuthRateLimit_UsesRemoteAddrNotXFF`、
+`TestAuthRateLimit_RejectionDoesNotRevealDimension`、
+`TestAuthRateLimit_EmailKeyIsHMACNotPlaintext`、
+`TestChatRateLimit_MissingUserIDFailsClosed`、
+★`TestLogin_RateLimitedResponseIsIdenticalForUnknownEmail`
+
+最后那条打 ★ 是因为它守的是 CLAUDE.md 的第一条不变量（账号枚举）：对一个**已注册**
+邮箱和一个**未注册**邮箱各打到 42901，两次的状态码、业务码、文案、`Retry-After`、
+响应体字节必须完全一致。设计上天然成立（桶按提交的邮箱做 key，不查库），但**没有
+用例锁着就等于没有保证**。
 
 ## 测试约定
 
@@ -347,4 +511,4 @@ TaskService ──要──> agentclient.Client ──要──> EventHandler �
 
 回收器复用那个**不带客户端**的 `statusWriter`：它只写状态，从不联系 Agent —— 一个连不上的 Agent 正是它要处理的情况。它跑在自己的 `context.WithCancel` 上（不是请求 ctx），退出时先 `stopReconcile()` 再 `srv.Shutdown()`：它是纯后台循环，没有在途请求要照顾，让它在关闭过程中再扫一轮只会拖长关闭时间。
 
-已知未做：Agent 挂掉时**没有任何 HTTP 接口回 503**（`50300` / `50400` 的映射已经登记好，但派发失败走「标 failed + 200」、取消通知是 best-effort，两条路都不往上抛）；回收器**多副本会重复扫**（每个副本各扫各的，靠 `cas` 兜底不会写错，只是白烧几次查询，要治得加 advisory lock 或选主）；登录没有限流（`handler/auth.go` 有 TODO，bcrypt 的耗时拦不住撞库）；JWT 没有吊销机制（`jti` 已签进去，是将来做黑名单的钩子）；`Login` 里"用户不存在"分支比"口令错"少跑一次 bcrypt，存在约 160ms 的时间侧信道（代码注释里写明了）；`/internal` 目前和业务接口共用一个监听端口，生产上应该单独端口或由网关按前缀挡在公网外。
+已知未做：Agent 挂掉时**没有任何 HTTP 接口回 503**（`50300` / `50400` 的映射已经登记好，但派发失败走「标 failed + 200」、取消通知是 best-effort，两条路都不往上抛）；回收器**多副本会重复扫**（每个副本各扫各的，靠 `cas` 兜底不会写错，只是白烧几次查询，要治得加 advisory lock 或选主）；**限流只在配了 `REDIS_ADDR` 的部署里存在**（没配的话登录注册和建任务三条路全是裸的，只有启动时一条 Warn 兜着，见「限流」一节）；**没有并发信号量**（限流挡突发不挡并发 —— `agentclient` 至今没有并发上限，稳定 5/s 持续半小时就是 9000 个在跑的任务；配额管总量、限流管速率、信号量管并发，三者不能互相替代）；JWT 没有吊销机制（`jti` 已签进去，是将来做黑名单的钩子）；`Login` 里"用户不存在"分支比"口令错"少跑一次 bcrypt，存在约 160ms 的时间侧信道（代码注释里写明了）；`/internal` 目前和业务接口共用一个监听端口，生产上应该单独端口或由网关按前缀挡在公网外。

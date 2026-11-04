@@ -1,5 +1,9 @@
 server:
   addr: ":8080"
+  # 可信代理的 IP/CIDR。**留空 = 谁都不信**,ClientIP() 只认 socket 对端。
+  # gin 默认信任所有代理,不配的话 X-Forwarded-For 可以随便伪造,按 IP 的限流直接作废。
+  # 每一项在 config.Validate 里就会被 ParseIP/ParseCIDR 校验,拼错就启动失败。
+  # trusted_proxies: ["10.0.0.0/8"]
 
 database:
   # 开发用。DSN 带口令,生产环境用 DB_DSN 环境变量覆盖,别往这个文件里写真口令。
@@ -39,3 +43,43 @@ jwt:
   access_ttl: "2h"
   # 签名密钥不在这里 —— 只从 JWT_SECRET 环境变量读,至少 32 字节。
   # 生成一个:openssl rand -base64 48
+
+# Redis。**addr 为空就不启用限流**(默认就是空),服务其余部分照常工作,
+# 启动时会打一条 Warn 说明这个部署没有这层防护。
+# 口令不在这里 —— 只从 REDIS_PASSWORD 环境变量读(字段上打了 yaml:"-")。
+redis:
+  addr: ""
+  db: 0
+
+# 限流。每一层 limit 设成 0 就关掉那一层;redis.addr 为空时整块都不生效。
+#
+# 三种控制回答三个不同的问题,不能互相替代:
+#   quota 管"总共能建多少"、这里管"多久来一个"、并发信号量管"同时几个在跑"(还没做)。
+rate_limit:
+  # 登录/注册的全局闸。**这是过载保护,不是安全措施**:
+  # bcrypt cost 12 一次约 160ms,50/s 要 8 核专门伺候才扛得住 ——
+  # 定在 10/s 这道闸才真的会生效,而不是永远触发不了的装饰。
+  # login 和 register **各算一个桶**,所以 bcrypt 的总负载上限是 20/s:
+  # 注册被刷爆不该连带把老用户锁在登录之外。
+  auth_global_limit: 10
+  auth_global_window: "1s"
+
+  # 按 IP。**必须比 email 高一个数量级** —— 两个维度防的不是一回事,
+  # 拿 email 的阈值去卡 IP,一个公司/学校的 NAT 出口(整栋楼共用一个 IP)会被整体误伤。
+  ip_limit: 30
+  ip_window: "1m"
+
+  # 按邮箱。**真正在防撞库的就是这一层** —— 撞库就是对着同一个账号试口令。
+  # 邮箱进 key 之前会过 HMAC(Redis 的 key 会出现在 SLOWLOG / MONITOR / 面板里)。
+  email_limit: 5
+  email_window: "1m"
+
+  # 建任务的全局闸。挡突发脚本,给 Agent 留口气。
+  # 注意它**挡不住并发**:稳定 5/s 持续半小时就是 9000 个在跑的任务,
+  # 而 agentclient 至今没有并发上限。要管并发得上信号量。
+  chat_global_limit: 5
+  chat_global_window: "1s"
+
+  # 建任务,按登录用户。和 quota 的 200/24h 是两件事:那是总量,这是速率。
+  chat_user_limit: 10
+  chat_user_window: "1m"

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ratelimit"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/response"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/trace"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/service"
 )
 
@@ -224,5 +226,79 @@ func TestRouter_HealthNotLimitedWithLimiter(t *testing.T) {
 	r := handler.NewRouter(rlFullDeps(&rlRejectAll{}))
 	if _, code := rlDo(r, http.MethodGet, "/health", ""); code == response.CodeRateLimited {
 		t.Errorf("/health 被限流了")
+	}
+}
+
+// rlEnumAuth 对两个邮箱给出**不同**的结果:注册过的那个登录成功,
+// 没注册过的那个按 model.ErrInvalidCredentials 失败。
+//
+// 这个假实现的作用是:如果限流那条路径上有任何一处碰了账号状态,
+// 两个邮箱的响应就会分叉,下面那条用例立刻就红。
+type rlEnumAuth struct{ reached int }
+
+func (a *rlEnumAuth) Register(context.Context, string, string, string) (*service.Credential, error) {
+	a.reached++
+	return nil, model.ErrEmailOccupied
+}
+
+func (a *rlEnumAuth) Login(_ context.Context, email, _ string) (*service.Credential, error) {
+	a.reached++
+	if email == "registered@example.com" {
+		return &service.Credential{User: &model.User{ID: 1}, Token: "t", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	}
+	return nil, model.ErrInvalidCredentials
+}
+
+// TestLogin_RateLimitedResponseIsIdenticalForUnknownEmail 守 CLAUDE.md 的
+// 第一条安全不变量 —— 账号枚举 —— 在限流这条新路径上同样成立。
+//
+// 被限流的响应对"已注册"和"未注册"两个邮箱必须**完全一样**:状态码、
+// 响应体字节、以及全部响应头。不一样的话 42901 就成了账号探测器:
+// 攻击者不需要猜中口令,只要比较两个 429 的差别就能问出邮箱是否注册。
+//
+// 设计上这是天然成立的 —— 桶键只由提交上来的邮箱算出来,整条路径不查库 ——
+// 但**没有用例锁着就等于没有保证**。以后有人为了"更友好的提示"往限流
+// 响应里加一句"该账号暂时被锁定",这条用例会立刻红。
+//
+// trace_id 要固定住:它进响应体,不固定的话两次必然不同,比较就没意义了。
+func TestLogin_RateLimitedResponseIsIdenticalForUnknownEmail(t *testing.T) {
+	auth := &rlEnumAuth{}
+	lim := &rlRejectAll{}
+	d := handler.Deps{Auth: auth, Limiter: lim}
+	r := handler.NewRouter(d)
+
+	do := func(email string) *httptest.ResponseRecorder {
+		body := `{"email":"` + email + `","password":"password123"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(trace.Header, "fixedtraceid")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	known := do("registered@example.com")
+	unknown := do("nobody@example.com")
+
+	if known.Code != http.StatusTooManyRequests {
+		t.Fatalf("已注册邮箱的状态码 = %d, 期望 429", known.Code)
+	}
+	if known.Code != unknown.Code {
+		t.Fatalf("状态码不同: %d vs %d", known.Code, unknown.Code)
+	}
+	if known.Body.String() != unknown.Body.String() {
+		t.Fatalf("响应体不同:\n%s\n%s", known.Body.String(), unknown.Body.String())
+	}
+	if !reflect.DeepEqual(known.Result().Header, unknown.Result().Header) {
+		t.Fatalf("响应头不同:\n%v\n%v", known.Result().Header, unknown.Result().Header)
+	}
+
+	// 最要紧的一条:被限流时 service 一次都不该被调到。
+	// 调到了就意味着账号状态在限流之前已经被查过,时间侧信道就还在。
+	if auth.reached != 0 {
+		t.Errorf("被限流的请求进了 service %d 次,账号状态不该在限流之前被碰", auth.reached)
+	}
+	if lim.calls != 2 {
+		t.Errorf("限流器被调 %d 次, 期望 2", lim.calls)
 	}
 }
