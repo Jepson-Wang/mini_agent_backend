@@ -31,6 +31,13 @@ func clearEnv(t *testing.T) {
 		"RECONCILE_INTERVAL", "RECONCILE_STALE_AFTER", "RECONCILE_BATCH",
 		"TASK_QUOTA_WINDOW", "TASK_QUOTA_MAX",
 		"JWT_ISSUER", "JWT_SECRET", "JWT_ACCESS_TTL",
+		"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB",
+		"RATELIMIT_AUTH_GLOBAL_LIMIT", "RATELIMIT_AUTH_GLOBAL_WINDOW",
+		"RATELIMIT_IP_LIMIT", "RATELIMIT_IP_WINDOW",
+		"RATELIMIT_EMAIL_LIMIT", "RATELIMIT_EMAIL_WINDOW",
+		"RATELIMIT_CHAT_GLOBAL_LIMIT", "RATELIMIT_CHAT_GLOBAL_WINDOW",
+		"RATELIMIT_CHAT_USER_LIMIT", "RATELIMIT_CHAT_USER_WINDOW",
+		"TRUSTED_PROXIES",
 	} {
 		// 两步走。t.Setenv 是为了登记 cleanup,测试结束把原值还回去;
 		// Unsetenv 才是真清 —— godotenv 用 LookupEnv 判断"已存在",
@@ -717,5 +724,148 @@ func TestLoad_QuotaZeroWindowRejected(t *testing.T) {
 
 	if _, err := Load(writeYAML(t, minimalYAML)); err == nil {
 		t.Fatal("启用配额时窗口为 0 应当报错")
+	}
+}
+
+// ---- Redis 与限流 ----
+
+func TestLoad_RedisDisabledByDefault(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Redis.Addr != "" {
+		t.Errorf("Redis.Addr = %q, 期望默认为空(不启用限流)", cfg.Redis.Addr)
+	}
+}
+
+func TestLoad_RateLimitDefaults(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	rl := cfg.RateLimit
+	cases := []struct {
+		name   string
+		limit  int
+		window time.Duration
+		wantL  int
+		wantW  time.Duration
+	}{
+		{"AuthGlobal", rl.AuthGlobalLimit, rl.AuthGlobalWindow, 10, time.Second},
+		{"IP", rl.IPLimit, rl.IPWindow, 30, time.Minute},
+		{"Email", rl.EmailLimit, rl.EmailWindow, 5, time.Minute},
+		{"ChatGlobal", rl.ChatGlobalLimit, rl.ChatGlobalWindow, 5, time.Second},
+		{"ChatUser", rl.ChatUserLimit, rl.ChatUserWindow, 10, time.Minute},
+	}
+	for _, c := range cases {
+		if c.limit != c.wantL || c.window != c.wantW {
+			t.Errorf("%s = %d/%v, 期望 %d/%v", c.name, c.limit, c.window, c.wantL, c.wantW)
+		}
+	}
+}
+
+func TestLoad_RateLimitFromEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("REDIS_ADDR", "localhost:6379")
+	t.Setenv("REDIS_PASSWORD", "pw")
+	t.Setenv("REDIS_DB", "3")
+	t.Setenv("RATELIMIT_IP_LIMIT", "99")
+	t.Setenv("RATELIMIT_IP_WINDOW", "2m")
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Redis.Addr != "localhost:6379" || cfg.Redis.Password != "pw" || cfg.Redis.DB != 3 {
+		t.Errorf("Redis = %+v", cfg.Redis)
+	}
+	if cfg.RateLimit.IPLimit != 99 {
+		t.Errorf("IPLimit = %d, 期望 99", cfg.RateLimit.IPLimit)
+	}
+	if cfg.RateLimit.IPWindow != 2*time.Minute {
+		t.Errorf("IPWindow = %v, 期望 2m", cfg.RateLimit.IPWindow)
+	}
+}
+
+func TestLoad_RateLimitNotCheckedWhenRedisDisabled(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	// 没配 Redis,限流配置坏成什么样都不该挡住启动。
+	t.Setenv("RATELIMIT_IP_LIMIT", "5")
+	t.Setenv("RATELIMIT_IP_WINDOW", "0s")
+
+	if _, err := Load(writeYAML(t, minimalYAML)); err != nil {
+		t.Fatalf("Redis 未配置时不应检查限流字段: %v", err)
+	}
+}
+
+func TestLoad_RateLimitWindowRequiredWhenLimitSet(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("REDIS_ADDR", "localhost:6379")
+	t.Setenv("RATELIMIT_IP_LIMIT", "5")
+	t.Setenv("RATELIMIT_IP_WINDOW", "0s")
+
+	if _, err := Load(writeYAML(t, minimalYAML)); err == nil {
+		t.Fatal("limit > 0 而 window = 0 应当被拒绝")
+	}
+}
+
+func TestLoad_AllRateLimitsZeroIsRejected(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("REDIS_ADDR", "localhost:6379")
+	for _, k := range []string{
+		"RATELIMIT_AUTH_GLOBAL_LIMIT", "RATELIMIT_IP_LIMIT", "RATELIMIT_EMAIL_LIMIT",
+		"RATELIMIT_CHAT_GLOBAL_LIMIT", "RATELIMIT_CHAT_USER_LIMIT",
+	} {
+		t.Setenv(k, "0")
+	}
+
+	if _, err := Load(writeYAML(t, minimalYAML)); err == nil {
+		t.Fatal("配了 Redis 但五层上限全为 0 应当被拒绝")
+	}
+}
+
+func TestLoad_RedisPasswordNeverFromYAML(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+
+	_, err := Load(writeYAML(t, minimalYAML+"\nredis:\n  addr: \"localhost:6379\"\n  password: leaked-from-yaml\n"))
+	if err == nil {
+		t.Fatal("往 YAML 里写 redis.password 应当被 Strict 模式拒绝")
+	}
+}
+
+func TestLoad_TrustedProxiesFromEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("TRUSTED_PROXIES", "10.0.0.1, 10.0.0.0/8 ,")
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.Server.TrustedProxies
+	if len(got) != 2 || got[0] != "10.0.0.1" || got[1] != "10.0.0.0/8" {
+		t.Errorf("TrustedProxies = %q, 期望 [10.0.0.1 10.0.0.0/8]", got)
+	}
+}
+
+func TestLoad_BadTrustedProxyRejected(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("TRUSTED_PROXIES", "10.0.0.1,not-an-ip")
+
+	if _, err := Load(writeYAML(t, minimalYAML)); err == nil {
+		t.Fatal("非法的可信代理条目应当让启动失败")
 	}
 }

@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -33,11 +34,17 @@ type Config struct {
 	Agent     Agent     `yaml:"agent"`
 	Quota     Quota     `yaml:"quota"`
 	Reconcile Reconcile `yaml:"reconcile"`
+	Redis     Redis     `yaml:"redis"`
+	RateLimit RateLimit `yaml:"rate_limit"`
 	JWT       JWT       `yaml:"jwt"`
 }
 
 type Server struct {
 	Addr string `yaml:"addr"`
+
+	// TrustedProxies 可信反向代理(IP 或 CIDR)。nil 表示谁都不信。
+	// 启动时逐项校验,见 validateTrustedProxies。
+	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
 type Database struct {
@@ -133,6 +140,31 @@ type Reconcile struct {
 	Batch int `yaml:"batch"`
 }
 
+// Redis 是限流用的 Redis 连接参数。Addr 为空表示不启用(没有默认值)。
+type Redis struct {
+	Addr string `yaml:"addr"`
+
+	// Password 只从 REDIS_PASSWORD 读。yaml:"-" 的理由同 JWT.Secret。
+	Password string `yaml:"-"`
+
+	DB int `yaml:"db"`
+}
+
+// RateLimit 是各层限流的阈值与窗口。仅在配置了 Redis.Addr 时才会被检查和使用。
+// 某层 Limit 为 0 表示关掉这一层。
+type RateLimit struct {
+	AuthGlobalLimit  int           `yaml:"auth_global_limit"`
+	AuthGlobalWindow time.Duration `yaml:"auth_global_window"`
+	IPLimit          int           `yaml:"ip_limit"`
+	IPWindow         time.Duration `yaml:"ip_window"`
+	EmailLimit       int           `yaml:"email_limit"`
+	EmailWindow      time.Duration `yaml:"email_window"`
+	ChatGlobalLimit  int           `yaml:"chat_global_limit"`
+	ChatGlobalWindow time.Duration `yaml:"chat_global_window"`
+	ChatUserLimit    int           `yaml:"chat_user_limit"`
+	ChatUserWindow   time.Duration `yaml:"chat_user_window"`
+}
+
 type JWT struct {
 	// Secret HS256 的签名密钥,只从 JWT_SECRET 环境变量读。
 	// yaml:"-" 是刻意的:哪怕有人往配置文件里写了,也不会被加载进来。
@@ -173,6 +205,14 @@ func defaults() Config {
 		JWT: JWT{
 			Issuer:    "mini-agent",
 			AccessTTL: 2 * time.Hour,
+		},
+		// Redis 不给默认地址:空表示本部署没有 Redis、不启用限流。
+		RateLimit: RateLimit{
+			AuthGlobalLimit: 10, AuthGlobalWindow: time.Second,
+			IPLimit: 30, IPWindow: time.Minute,
+			EmailLimit: 5, EmailWindow: time.Minute,
+			ChatGlobalLimit: 5, ChatGlobalWindow: time.Second,
+			ChatUserLimit: 10, ChatUserWindow: time.Minute,
 		},
 	}
 }
@@ -278,6 +318,42 @@ func (c *Config) applyEnv() error {
 	if err := setInt(&c.Quota.MaxTasks, "TASK_QUOTA_MAX"); err != nil {
 		return err
 	}
+	// Redis 没有默认地址:空表示不启用限流。口令只走环境变量。
+	setString(&c.Redis.Addr, "REDIS_ADDR")
+	setString(&c.Redis.Password, "REDIS_PASSWORD")
+	if err := setInt(&c.Redis.DB, "REDIS_DB"); err != nil {
+		return err
+	}
+	rl := &c.RateLimit
+	for _, it := range []struct {
+		dst *int
+		env string
+	}{
+		{&rl.AuthGlobalLimit, "RATELIMIT_AUTH_GLOBAL_LIMIT"},
+		{&rl.IPLimit, "RATELIMIT_IP_LIMIT"},
+		{&rl.EmailLimit, "RATELIMIT_EMAIL_LIMIT"},
+		{&rl.ChatGlobalLimit, "RATELIMIT_CHAT_GLOBAL_LIMIT"},
+		{&rl.ChatUserLimit, "RATELIMIT_CHAT_USER_LIMIT"},
+	} {
+		if err := setInt(it.dst, it.env); err != nil {
+			return err
+		}
+	}
+	for _, it := range []struct {
+		dst *time.Duration
+		env string
+	}{
+		{&rl.AuthGlobalWindow, "RATELIMIT_AUTH_GLOBAL_WINDOW"},
+		{&rl.IPWindow, "RATELIMIT_IP_WINDOW"},
+		{&rl.EmailWindow, "RATELIMIT_EMAIL_WINDOW"},
+		{&rl.ChatGlobalWindow, "RATELIMIT_CHAT_GLOBAL_WINDOW"},
+		{&rl.ChatUserWindow, "RATELIMIT_CHAT_USER_WINDOW"},
+	} {
+		if err := setDuration(it.dst, it.env); err != nil {
+			return err
+		}
+	}
+	setStringSlice(&c.Server.TrustedProxies, "TRUSTED_PROXIES")
 	return nil
 }
 
@@ -315,6 +391,22 @@ func setInt(dst *int, env string) error {
 	}
 	*dst = n
 	return nil
+}
+
+// setStringSlice 解析逗号分隔的列表。变量没设或是空串就不动 dst;
+// 否则按逗号切开,每项去首尾空白,丢掉空项("a, b ," 得到 [a b])。
+func setStringSlice(dst *[]string, env string) {
+	v := os.Getenv(env)
+	if v == "" {
+		return
+	}
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	*dst = out
 }
 
 // checkWireSecret 校验一把**要在链路上传输**的共享密钥。
@@ -416,7 +508,16 @@ func (c *Config) Validate() error {
 	if err := c.Quota.validate(); err != nil {
 		return err
 	}
-	return c.Reconcile.validate()
+	if err := c.Reconcile.validate(); err != nil {
+		return err
+	}
+	if err := c.Redis.validate(); err != nil {
+		return err
+	}
+	if err := c.RateLimit.validate(c.Redis.Addr != ""); err != nil {
+		return err
+	}
+	return validateTrustedProxies(c.Server.TrustedProxies)
 }
 
 // validate 校验配额配置。MaxTasks <= 0 表示不限额,这时窗口随便填。
@@ -446,6 +547,79 @@ func (r Reconcile) validate() error {
 	}
 	if r.Batch <= 0 {
 		return fmt.Errorf("reconcile.batch 必须大于 0,当前为 %d", r.Batch)
+	}
+	return nil
+}
+
+// validate 校验限流配置。redisEnabled 为 false(没配 Redis 地址)时**整体跳过**:
+// 限流器根本不会被创建,这时窗口、阈值写成什么都不会被用到 ——
+// 和 Quota.MaxTasks <= 0、Reconcile.Interval <= 0 是同一种短路。
+func (r RateLimit) validate(redisEnabled bool) error {
+	if !redisEnabled {
+		return nil
+	}
+	layers := []struct {
+		name   string
+		limit  int
+		window time.Duration
+	}{
+		{"auth_global", r.AuthGlobalLimit, r.AuthGlobalWindow},
+		{"ip", r.IPLimit, r.IPWindow},
+		{"email", r.EmailLimit, r.EmailWindow},
+		{"chat_global", r.ChatGlobalLimit, r.ChatGlobalWindow},
+		{"chat_user", r.ChatUserLimit, r.ChatUserWindow},
+	}
+	enabled := 0
+	for _, l := range layers {
+		if l.limit < 0 {
+			return fmt.Errorf("rate_limit.%s_limit 不能为负,当前为 %d(0 表示关掉这一层)", l.name, l.limit)
+		}
+		if l.limit > 0 {
+			enabled++
+			if l.window <= 0 {
+				return fmt.Errorf("启用限流时 rate_limit.%s_window 必须大于 0,当前为 %v", l.name, l.window)
+			}
+		}
+	}
+	// 配了 Redis 却把五层全关成 0:看起来限流已经启用(启动时还会去连 Redis),
+	// 实际一个请求都不会拦。和 BreakerThreshold > 0 配 BreakerCooldown = 0 同理,
+	// 这种"看似启用、实则无效"的配置比明确关掉危险 —— 要关就别配 REDIS_ADDR。
+	if enabled == 0 {
+		return fmt.Errorf("已配置 redis.addr 但 rate_limit 五层上限全为 0,限流形同虚设;" +
+			"要关掉限流请不要配置 redis.addr")
+	}
+	return nil
+}
+
+// validate 校验 Redis 配置。Addr 为空表示不启用,这时其余字段随便填。
+func (r Redis) validate() error {
+	if r.Addr == "" {
+		return nil
+	}
+	if r.DB < 0 {
+		return fmt.Errorf("redis.db 不能为负,当前为 %d", r.DB)
+	}
+	return nil
+}
+
+// validateTrustedProxies 逐项检查可信代理(单个 IP 或 CIDR)。
+//
+// 必须在启动时就校验:NewRouter 会把它交给 gin 的 SetTrustedProxies,
+// 而那个函数的 error 没法从只返回 *gin.Engine 的 NewRouter 里传出去。
+// 拼错一项被吞掉的后果是 gin 谁都不信 —— 部署在反向代理后面时,
+// 所有客户端的 ClientIP 都变成代理自己的地址,按 IP 的限流悄悄退化成
+// 全体共用一份额度,而日志里没有任何异常。所以宁可启动失败。
+func validateTrustedProxies(list []string) error {
+	for _, p := range list {
+		if strings.Contains(p, "/") {
+			if _, _, err := net.ParseCIDR(p); err != nil {
+				return fmt.Errorf("server.trusted_proxies 里的 %q 不是合法的 CIDR: %w", p, err)
+			}
+			continue
+		}
+		if net.ParseIP(p) == nil {
+			return fmt.Errorf("server.trusted_proxies 里的 %q 不是合法的 IP 或 CIDR", p)
+		}
 	}
 	return nil
 }
