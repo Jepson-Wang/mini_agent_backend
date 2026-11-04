@@ -163,8 +163,64 @@ func New(rdb redis.Scripter) *Limiter {
 // 反过来 fail-closed 会让一次 Redis 抖动变成全站登不进去,把局部故障放大
 // 成整站不可用。
 func (l *Limiter) Allow(ctx context.Context, buckets []Bucket) (Result, error) {
-	// TODO(阶段 1):实现。
-	return Result{}, nil
+	if l == nil {
+		return Result{Allowed: true}, nil
+	}
+
+	// 滤掉不限的桶。这一步不能省:Limit <= 0 的桶进了脚本会让 ZCARD >= limit
+	// 恒真,拒绝一切请求。
+	live := make([]Bucket, 0, len(buckets))
+	for _, b := range buckets {
+		if b.Rule.Limit <= 0 {
+			continue
+		}
+		// 有额度却没窗口是接线/配置错误。不静默跳过:config.Validate 本该挡掉它,
+		// 漏到这里就大声报错,让调用方按 fail-open 记一次可见的失败,而不是悄悄少一层防线。
+		if b.Rule.Window.Milliseconds() <= 0 {
+			return Result{}, fmt.Errorf("限流桶 %q 的窗口必须至少 1ms,实际 %v", b.Scope, b.Rule.Window)
+		}
+		live = append(live, b)
+	}
+	if len(live) == 0 {
+		return Result{Allowed: true}, nil
+	}
+
+	keys := make([]string, len(live))
+	args := make([]any, 0, 1+2*len(live))
+	args = append(args, l.member())
+	for i, b := range live {
+		keys[i] = b.Key
+		args = append(args, b.Rule.Window.Milliseconds(), b.Rule.Limit)
+	}
+
+	reply, err := l.script.Run(ctx, l.rdb, keys, args...).Slice()
+	if err != nil {
+		return Result{}, err
+	}
+	if len(reply) != 3 {
+		return Result{}, fmt.Errorf("限流脚本返回了 %d 个元素,期望 3 个", len(reply))
+	}
+	var vals [3]int64
+	for i, v := range reply {
+		n, ok := v.(int64)
+		if !ok {
+			return Result{}, fmt.Errorf("限流脚本返回的第 %d 个元素类型是 %T,期望 int64", i+1, v)
+		}
+		vals[i] = n
+	}
+	allowed, idx, retryMs := vals[0], vals[1], vals[2]
+
+	if allowed == 1 {
+		return Result{Allowed: true}, nil
+	}
+	if idx < 1 || idx > int64(len(live)) {
+		return Result{}, fmt.Errorf("限流脚本返回的桶序号 %d 越界(共 %d 个桶)", idx, len(live))
+	}
+	return Result{
+		Allowed:    false,
+		RetryAfter: time.Duration(retryMs) * time.Millisecond,
+		Scope:      live[idx-1].Scope,
+	}, nil
 }
 
 // defaultMember 返回一个进程内唯一、跨副本也几乎不可能相撞的后缀。
