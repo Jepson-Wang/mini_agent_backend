@@ -297,7 +297,7 @@ func chatEngine(l middleware.Limiter, withAuth bool, uid int64, reached *bool, g
 	r := gin.New()
 	r.Use(middleware.TraceID())
 	if withAuth {
-		r.Use(middleware.Auth(fakeVerifier{uid: uid}))
+		r.Use(middleware.Auth(fakeVerifier{uid: uid}, nil))
 	}
 	r.Use(middleware.ChatRateLimit(l, middleware.ChatLimits{
 		Global: ratelimit.Rule{Window: time.Minute, Limit: 100},

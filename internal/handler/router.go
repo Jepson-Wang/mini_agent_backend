@@ -27,6 +27,15 @@ type Deps struct {
 	// 传 nil 的话私有接口一律 500 而不是放行,见 middleware.Auth。
 	Verifier middleware.TokenVerifier
 
+	// Revoker 查令牌的吊销状态。
+	//
+	// 传 nil 表示这个部署没启用吊销(比如没配 Redis):
+	// 私有接口照常工作,只是被登出/禁用的令牌还能用到过期。
+	//
+	// **和 Verifier == nil 的方向不一样**,理由见 middleware.Auth 的注释:
+	// 前者是接线错误(fail closed),后者是没启用这层防护(fail open)。
+	Revoker middleware.Revoker
+
 	// Auth 处理注册和登录。传 nil 时这两个接口一律 500 —— 路由照常注册,
 	// 因为"接口不存在(404)"和"接口没接好(500)"是两回事,别混。
 	Auth AuthService
@@ -138,8 +147,15 @@ func NewRouter(d Deps) *gin.Engine {
 	// ---- 私有路由:统一挂 Auth ----
 
 	private := api.Group("")
-	private.Use(middleware.Auth(d.Verifier))
+	private.Use(middleware.Auth(d.Verifier, d.Revoker))
 	{
+		// 登出挂在私有组上:它要知道当前是哪个令牌才能吊销它。
+		//
+		// 挂在公开组上的话就没有 jti 可用 —— 也就没法只踢掉这一个会话,
+		// 而把该用户的所有设备一起踢掉(那该用用户级 not_before)。
+		auth := NewAuthHandler(d.Auth)
+		private.POST("/auth/logout", auth.Logout)
+
 		// 会话,以及挂在会话下面的任务。
 		session := NewSessionHandler(d.Session)
 

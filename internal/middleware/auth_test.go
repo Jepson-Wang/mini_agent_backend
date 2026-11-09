@@ -34,10 +34,15 @@ func newManager(t *testing.T) *token.Manager {
 
 // newEngine 装一个最小的私有路由:Auth 通过后回显 MustUserID 取到的用户。
 func newEngine(v middleware.TokenVerifier) *gin.Engine {
+	return newEngineWithRevoker(v, nil)
+}
+
+// newEngineWithRevoker 装一个带吊销检查的私有路由。
+func newEngineWithRevoker(v middleware.TokenVerifier, revoker middleware.Revoker) *gin.Engine {
 	r := gin.New()
 	r.Use(middleware.TraceID())
 	private := r.Group("")
-	private.Use(middleware.Auth(v))
+	private.Use(middleware.Auth(v, revoker))
 	private.GET("/me", func(c *gin.Context) {
 		response.OK(c, gin.H{"uid": middleware.MustUserID(c)})
 	})
@@ -222,7 +227,7 @@ func TestAuth_AbortsBeforeHandler(t *testing.T) {
 	r := gin.New()
 	r.Use(middleware.TraceID())
 	private := r.Group("")
-	private.Use(middleware.Auth(newManager(t)))
+	private.Use(middleware.Auth(newManager(t), nil))
 	private.GET("/me", func(c *gin.Context) {
 		reached = true
 		c.Status(http.StatusOK)

@@ -45,6 +45,8 @@ func (rlAuth) Login(context.Context, string, string) (*service.Credential, error
 	return &service.Credential{User: &model.User{ID: 1}, Token: "t", ExpiresAt: time.Now().Add(time.Hour)}, nil
 }
 
+func (rlAuth) Logout(context.Context, string, time.Time) error { return nil }
+
 type rlVerifier struct{}
 
 func (rlVerifier) Verify(context.Context, string) (int64, error) { return 7, nil }
@@ -248,6 +250,8 @@ func (a *rlEnumAuth) Login(_ context.Context, email, _ string) (*service.Credent
 	}
 	return nil, model.ErrInvalidCredentials
 }
+
+func (a *rlEnumAuth) Logout(context.Context, string, time.Time) error { return nil }
 
 // TestLogin_RateLimitedResponseIsIdenticalForUnknownEmail 守 CLAUDE.md 的
 // 第一条安全不变量 —— 账号枚举 —— 在限流这条新路径上同样成立。

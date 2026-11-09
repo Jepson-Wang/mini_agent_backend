@@ -262,7 +262,7 @@ func TestIssueFailurePropagates(t *testing.T) {
 
 // 没注入签发器是接线错误,要报错而不是 panic。
 func TestIssue_NilIssuer(t *testing.T) {
-	s := NewAuthService(nil, nil)
+	s := NewAuthService(nil, nil, nil)
 	if _, err := s.issue(&model.User{ID: 1}); err == nil {
 		t.Fatal("未注入 TokenIssuer 时应当报错")
 	}

@@ -163,6 +163,37 @@ HTTP 回调那条路由 `dto.TaskCallbackReq.Output` 的 `max` 挡着,两条汇�
 
 `TaskQuota` 收的是 `taskCounter` 接口而不是 `*repository.Repository`(同 `reconcile.go` 的 `staleLister`),所以 `quota_test.go` **不需要 `TEST_DSN`**。这一点是有意的:把一条防滥用规则押在"没有库就会被跳过"的用例上,等于没测。
 
+## JWT 吊销
+
+以前登出是**纯前端行为** —— 前端删掉本地 token,那个 token 在服务端仍然有效,直到 `AccessTTL`(默认 2 小时)过期。两个真实后果:用户改密码后攻击者手里的 token 还能用 2 小时;**管理员禁用一个用户之后,他现有的 token 还能用 2 小时**。第二条是实打实的安全洞,而且藏得深 —— 禁用检查只在 `Login` 里,`middleware.Auth` 一次库都不查。
+
+`internal/pkg/revoke` 补上了这一层。
+
+**`jti` 现在是签发必需项,生成失败要让 `Issue` 失败。** 之前它是「失败就用空串」,因为只用于日志。有了黑名单之后那个理由不成立了:**没有 jti 的 token 吊销不掉** —— 你没有任何东西可以拿去写进黑名单,等于发了一张注销不掉的卡。`Verify` 侧同样拒绝无 jti 的 token,这会让升级前签出的老令牌全部失效,**是有意的部署决策**,发版说明里要写「所有用户需重新登录」。
+
+**两种粒度不能互相替代。**
+
+| 场景 | 吊销什么 | 用哪种 |
+|---|---|---|
+| 登出 | 只有当前这一个令牌 | 单 token 黑名单(按 jti) |
+| 改密码 / 禁用账号 | 该用户全部令牌,包括你不知道存在的 | 用户级 `not_before`(按 user_id) |
+
+黑名单单独用不够:禁用用户时你手里没有他的 jti —— jti 只在他自己的 token 里,没法枚举「这个用户有哪些令牌在外面」。用户级单独用也不够:它是全有或全无,用它做登出会把该用户所有设备都踢下线。
+
+**黑名单的 TTL 必须等于 token 剩余有效期(`exp - now`)。** 短了吊销静默失效(用户以为登出了,其实没有),长了纯泄内存,`<= 0` 时根本不该写(那个 token 已经过期,JWT 校验会拒它)。这是 Redis 最漂亮的用法:**key 的生命周期和业务对象的生命周期完全对齐,垃圾回收交给 Redis,不需要任何清理任务。** 换成数据库表就得自己写定时任务删过期行,那套问题这个项目已经在 `Reconciler` 上踩过一遍了。`TestRevokeToken_TTLMatchesExpiry` 盯着这条。
+
+**用户级比较的方向不能反**:`token.iat < not_before` 才算被吊销。写反的话用户改完密码之后新登录的令牌也立刻失效,表现是「登录成功但马上又被踢」的死循环,单用户手工测试时很难第一时间联想到吊销逻辑。`TestRevokeUser_DoesNotAffectNewerTokens` 盯着这条。
+
+**吊销检查 fail open,但 `Verifier == nil` 仍然 fail closed。** 判据是**「前一道防线还在不在」**:`Verifier` 是身份校验本身,没了就是裸奔(fail closed);吊销是在一个**签名已经验过**的身份上再加一层,它失灵不代表身份可疑(fail open)。两个方向相反,而且必须相反。
+
+**被吊销时的文案和其它失败完全一样**（「登录状态无效或已过期」）。单独说「已吊销」会泄露信息:「这个令牌是被登出的还是被禁用的」就成了一条可观测的信号,和账号枚举是同一类问题。
+
+**`pkg/token` 不许 import `pkg/revoke`。** 组合发生在 `middleware.Auth`。反过来的话,一个能脱离一切依赖单测的签名工具包会变成要 Redis 才能测的包。`middleware.NewClaimsAdapter` 是那层薄适配器 —— 它让 `pkg/token.Manager` 能返回完整声明(jti 和 iat),方向是单向的 `middleware → token`,没有环。
+
+已知缺口:**没有 refresh token**,所以 `AccessTTL` 只能保持在 2h 这个体验可接受的值上,Redis 挂掉时吊销真空期的上界就是 2h。要缩短必须先做 refresh token(存储、轮转、重用检测、撤销链),那是独立的一块 —— 半做一个比不做更糟。
+
+对应的测试:`TestVerify_RejectsTokenWithoutJTI`、`TestRevokeToken_TTLMatchesExpiry`、`TestRevokeUser_DoesNotAffectNewerTokens`、`TestAuth_RevokedTokenRejected`、`TestAuth_RevokedMessageIsGeneric`、`TestAuth_RevokerErrorAllows`、`TestLogout_RevokesCurrentToken`。
+
 ## 限流
 
 登录注册和建任务三条路都挂了基于 Redis 的滑动窗口限流（`internal/pkg/ratelimit`）。
@@ -349,6 +380,7 @@ pending ──► running ──┐
 | GET | `/health` | 无 |
 | POST | `/api/v1/auth/register` | 无 |
 | POST | `/api/v1/auth/login` | 无 |
+| POST | `/api/v1/auth/logout` | `middleware.Auth`（用户 JWT） |
 | POST | `/api/v1/sessions` | `middleware.Auth`（用户 JWT） |
 | GET | `/api/v1/sessions` | 同上 |
 | GET | `/api/v1/sessions/:id` | 同上 |
@@ -399,7 +431,11 @@ pending ──► running ──┐
 
 这条规矩由 `internal/agentclient/imports_test.go` 的 `TestOnlyAgentClientImportsProto` 守着：它遍历整个仓库解析 import。配套的 `TestProtoPkgIsActuallyImportedHere` 防的是常量过期后前者一直绿着却什么也没查。要加东西就在 `agentclient` 里加一个本地类型，照 `Event` / `CancelTaskReq` 的样子来。
 
-未知的事件类型翻成 `EventUnknown` 后**照样往下发**（payload 还在），只是多记一条 Warn —— 直接丢弃的话，「对面升级了、我们没跟上」这件事没人会发现。
+未知的事件类型翻成 `EventUnknown` 后**照样往下发**（payload 还在），只是多记一条 Warn —— 直接丢弃的话，「对面升级了、我们没跟上」这件事没人会发生。
+
+★ **这条 Warn 的价值在于它是稀有的**，所以别拿它报日常事件。压缩事件以前按 `EVENT_TYPE_UNSPECIFIED` 发，于是**每次压缩**都触发一条"未知类型"的 Warn —— 而这条 Warn 的本意是"对面升级了、我们没跟上"，用它报"对面没跟上"的日常事件，信号就被稀释了：真漏了某个新事件时没人看得见。压缩事件现在有专属枚举（`EVENT_TYPE_COMPACTING` / `_COMPACTED` = 7 / 8，**只追加**、不改动已有编号），Go 侧登记在 `agentclient.eventTypes` 里。
+
+★ **加枚举值是跨仓库改动**，顺序固定：先改 backend 的 `proto/agent/v1/agent.proto`（**权威副本**）→ 复制到 Agent 仓库的 `mini_agent/proto/agent/v1/agent.proto`（两份必须逐字节一致）→ 两边各自重新生成（backend `make proto`；Agent 侧 `grpc_tools.protoc`）→ 更新两边的映射表（Go 的 `eventTypes`、Python 的 `_EVENT_TYPES`）。proto3 的枚举是开放的，所以**先升哪边都不会崩**：对面没认的新值落进 `EventUnknown` 分支，照样往下发、只多一条 Warn —— 不会错认成别的类型。
 
 `var _ Client = (*GRPCClient)(nil)` 那行别删 —— 少了它接口和实现漂移了编译器不会吭声。
 
@@ -501,6 +537,24 @@ pending ──► running ──┐
 
 **`Touch` 的节流在 SQL 的 `WHERE updated_at < ?` 里，不在内存里。** 内存里记「上次 touch 时间」要按 `task_uid` 存一张表还得清理，而且多副本部署时每个副本各记各的、节流直接失效。`Touch` 只续 `running`：`pending` 意味着还没交接成功，那正是回收器该来看一眼的状态，给它续命等于把交接失败永远藏起来。
 
+#### 选主：多副本只让一个扫
+
+多副本部署时每个副本都会跑这个循环，于是它们捞同一批任务。`cas` 在下游兜着，**不会写错任何数据**，只是白烧几次 `SELECT`。`internal/pkg/redislock` 补的是这一点：一轮开始前先抢一次锁，没抢到的直接跳过这一轮。
+
+**用的是单实例 `SET NX PX`，不是 Redlock，这是刻意的。** 这把锁**不保护正确性**——没有它，多副本重复扫的后果只是重复执行一次幂等操作，不是数据损坏。Redlock 的复杂度（多实例、时钟假设）是为「锁失效会破坏数据」的场景准备的，而那种场景真正需要的是 fencing token；这里 `cas` 本身就是 fencing。
+
+**拿不到锁就跳过，不自旋、不等待。** 回收器是兜底机制，晚一分钟完全无所谓；自旋只会让所有副本挤在一起抢同一把锁。
+
+**Redis 挂了要当作拿到锁，照常扫（fail open）。** 回收器本身就是兜底，让兜底依赖另一个会挂的组件是反的。代价只是退化回「多副本重复扫」。`Acquire` 返回的 `ok` 表示「要不要拦下这一轮」（fail open 时也是 `true`），**`token` 非空才表示「真的持有锁」** —— 判断「要不要释放」必须看 `token`。
+
+**释放锁必须用 Lua**，脚本先比对 token 再删：`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`。`GET` 后再 `DEL` 是不够的——中间锁可能过期并被别人拿走，那就会把别人的锁删掉。`TestRelease_OnlyOwnLock` 盯着这条。
+
+**释放放在 `defer` 里。** `tick` 里有提前 `return` 的分支（`RunOnce` 报错那条），写成函数末尾手动释放的话，锁要挂满整个 TTL（45s）——而 `RunOnce` 报错恰好是数据库有问题的时候，也就是最需要下一轮快点重试的时候。
+
+**锁的 TTL（45s）必须大于 `reconcileTimeout`（30s），且不能做成独立配置项。** 小于的话一轮没跑完锁就过期，另一个副本会进来重复扫——静默失效，没有任何迹象。TTL 由 `reconcileTimeout` 推导出来（`reconcileLockTTL = reconcileTimeout + 15s`），改上面那个常量时它自动跟上。
+
+对应的测试：`TestAcquire_AfterExpiry`（TTL 真的设上了）、`TestAcquire_TwoInstancesAreMutuallyExclusive`（两个副本不能同时持有）、`TestRelease_OnlyOwnLock`（只删自己的锁）、`TestTick_SkipsWhenLockHeld`、`TestTick_ReleasesLockOnError`。
+
 ### main.go 的构造环
 
 ```
@@ -511,4 +565,4 @@ TaskService ──要──> agentclient.Client ──要──> EventHandler �
 
 回收器复用那个**不带客户端**的 `statusWriter`：它只写状态，从不联系 Agent —— 一个连不上的 Agent 正是它要处理的情况。它跑在自己的 `context.WithCancel` 上（不是请求 ctx），退出时先 `stopReconcile()` 再 `srv.Shutdown()`：它是纯后台循环，没有在途请求要照顾，让它在关闭过程中再扫一轮只会拖长关闭时间。
 
-已知未做：Agent 挂掉时**没有任何 HTTP 接口回 503**（`50300` / `50400` 的映射已经登记好，但派发失败走「标 failed + 200」、取消通知是 best-effort，两条路都不往上抛）；回收器**多副本会重复扫**（每个副本各扫各的，靠 `cas` 兜底不会写错，只是白烧几次查询，要治得加 advisory lock 或选主）；**限流只在配了 `REDIS_ADDR` 的部署里存在**（没配的话登录注册和建任务三条路全是裸的，只有启动时一条 Warn 兜着，见「限流」一节）；**没有并发信号量**（限流挡突发不挡并发 —— `agentclient` 至今没有并发上限，稳定 5/s 持续半小时就是 9000 个在跑的任务；配额管总量、限流管速率、信号量管并发，三者不能互相替代）；JWT 没有吊销机制（`jti` 已签进去，是将来做黑名单的钩子）；`Login` 里"用户不存在"分支比"口令错"少跑一次 bcrypt，存在约 160ms 的时间侧信道（代码注释里写明了）；`/internal` 目前和业务接口共用一个监听端口，生产上应该单独端口或由网关按前缀挡在公网外。
+已知未做：Agent 挂掉时**没有任何 HTTP 接口回 503**（`50300` / `50400` 的映射已经登记好，但派发失败走「标 failed + 200」、取消通知是 best-effort，两条路都不往上抛）；**限流只在配了 `REDIS_ADDR` 的部署里存在**（没配的话登录注册和建任务三条路全是裸的，只有启动时一条 Warn 兜着，见「限流」一节）；**回收器的选主和 JWT 吊销也都依赖 Redis**（没配 `REDIS_ADDR` 时没有锁，多副本会重复扫同一批任务 —— 靠 `cas` 兜底不会写错，只是白烧几次查询；吊销也不生效，被登出/禁用的令牌还能用到过期。两条都是启动时一条 Warn 兜着，见「JWT 吊销」和「心跳与回收器」那节）；**没有并发信号量**（限流挡突发不挡并发 —— `agentclient` 至今没有并发上限，稳定 5/s 持续半小时就是 9000 个在跑的任务；配额管总量、限流管速率、信号量管并发，三者不能互相替代）；**没有 refresh token**（所以 `AccessTTL` 停在 2h，见「JWT 吊销」那节）；`Login` 里"用户不存在"分支比"口令错"少跑一次 bcrypt，存在约 160ms 的时间侧信道（代码注释里写明了）；`/internal` 目前和业务接口共用一个监听端口，生产上应该单独端口或由网关按前缀挡在公网外。

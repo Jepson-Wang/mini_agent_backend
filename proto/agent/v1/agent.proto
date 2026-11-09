@@ -67,4 +67,17 @@ enum EventType {
   EVENT_TYPE_TOOL_RESULT = 4;
   EVENT_TYPE_FINISHED    = 5;
   EVENT_TYPE_ERROR       = 6;
+  // 上下文压缩进度。compacting 是"开始压缩",compacted 是"压缩结束"。
+  //
+  // ★ 为什么需要专门的枚举。 之前这两个事件按 EVENT_TYPE_UNSPECIFIED 发出,
+  //   后果是 Go 那侧每次压缩都收到一条"未知类型的事件"告警 —— 而告警的意义
+  //   是"对面升级了、我们没跟上",用它来报"对面没跟上"的日常事件,信号就被稀释了:
+  //   真的漏了某个新事件时,这条告警已经淹没在压缩告警里。
+  // ★ compacted 携带的 payload 里有 ok 字段(compacted{ok:false, reason:"noop"}
+  //   表示这轮没压成),不是成功标志 —— 具体语义见 Agent 那侧的 _maybe_compress。
+  //
+  // 追加而不改动已有编号:proto3 的枚举是开放的,老客户端遇到不认识的值会当成
+  // unknown(见 agentclient.toEvent),不会把它错认成别的类型。
+  EVENT_TYPE_COMPACTING = 7;
+  EVENT_TYPE_COMPACTED  = 8;
 }

@@ -3,10 +3,12 @@ package handler
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/Jepson-Wang/mini_agent_backend/internal/handler/dto"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/middleware"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/response"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/trace"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/service"
@@ -19,6 +21,11 @@ import (
 type AuthService interface {
 	Register(ctx context.Context, email, password, nickname string) (*service.Credential, error)
 	Login(ctx context.Context, email, password string) (*service.Credential, error)
+
+	// Logout 吊销当前这一个令牌。
+	//
+	// 登出接口必须走 middleware.Auth:它要拿到 jti 和 exp 才知道吊销谁。
+	Logout(ctx context.Context, jti string, exp time.Time) error
 }
 
 // AuthHandler 处理注册和登录。
@@ -75,6 +82,38 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 
 	response.OK(c, dto.NewAuthResp(cred.User, cred.Token, cred.ExpiresAt))
+}
+
+// Logout 处理 POST /api/v1/auth/logout。
+//
+// 挂在**私有路由组**上(走 middleware.Auth):它要知道当前是哪个令牌,
+// 才能吊销它。挂在公开组上的话就没有 jti 可用。
+//
+// **只吊销当前这一个令牌**,不动该用户的其它设备 ——
+// 用户在手机上还登着,不该被这一次的登出踢下线。
+//
+// 幂等:重复登出、或者令牌本来就没被吊销过,都回 200。
+// 前端登出时不该因为"服务端说没这回事"而报错留在登录页。
+func (h *AuthHandler) Logout(c *gin.Context) {
+	if !h.ready(c) {
+		return
+	}
+
+	// jti 和 exp 由 middleware.Auth 放进来。
+	//
+	// 取不到 jti 说明这个部署的校验器没实现 ClaimsVerifier
+	// (也就是没启用吊销)。那就不吊销,直接回成功 ——
+	// 前端照样清本地 token,服务端这边没有可吊销的东西。
+	jti, _ := middleware.TokenJTI(c)
+	exp, _ := middleware.TokenExpiresAt(c)
+
+	if err := h.svc.Logout(c.Request.Context(), jti, exp); err != nil {
+		// 原始 err 进日志,不进响应体。
+		response.FailFromError(c, err)
+		return
+	}
+
+	response.OK(c, gin.H{})
 }
 
 // ready 挡住"路由注册了但依赖没注入"的接线错误。

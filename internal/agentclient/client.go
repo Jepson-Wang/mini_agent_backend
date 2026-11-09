@@ -194,6 +194,21 @@ const (
 	EventToolResult EventType = "tool_result"
 	EventFinished   EventType = "finished"
 	EventError      EventType = "error"
+
+	// EventCompacting 是"开始压缩上下文",EventCompacted 是"压缩结束"。
+	//
+	// ★ 这两个值以前不存在 —— Agent 那侧把压缩事件按 EVENT_TYPE_UNSPECIFIED 发,
+	//   于是每一次压缩,这边都会收到一条"未知类型的事件"告警。而那条告警的意义
+	//   是"对面升级了、我们没跟上",拿它报"对面没跟上"的日常事件,信号就被稀释了:
+	//   真漏了某个新事件时,这条告警已经淹没在压缩告警里。
+	//
+	// ★ 两个都是**进度**事件,不是终态。 IsTerminal 对它们返回 false。
+	//
+	// ★ compacted 的 payload 里有 ok 字段: compacted{ok:false, reason:"noop"}
+	//   表示这轮**没有**压成(没什么可压),不是失败。具体语义见 Agent 那侧
+	//   的 _maybe_compress。
+	EventCompacting EventType = "compacting"
+	EventCompacted  EventType = "compacted"
 )
 
 // IsTerminal 报告这条事件之后还会不会有别的事件。
@@ -255,6 +270,9 @@ var eventTypes = map[agentv1.EventType]EventType{
 	agentv1.EventType_EVENT_TYPE_TOOL_RESULT: EventToolResult,
 	agentv1.EventType_EVENT_TYPE_FINISHED:    EventFinished,
 	agentv1.EventType_EVENT_TYPE_ERROR:       EventError,
+	// 压缩进度。proto 里从 EVENT_TYPE_UNSPECIFIED 挪到了专属枚举(7/8)。
+	agentv1.EventType_EVENT_TYPE_COMPACTING: EventCompacting,
+	agentv1.EventType_EVENT_TYPE_COMPACTED:  EventCompacted,
 }
 
 // toEvent 把一条 protobuf 事件翻成本地事件。

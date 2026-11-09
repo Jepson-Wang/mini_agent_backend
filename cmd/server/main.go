@@ -21,7 +21,9 @@ import (
 	"github.com/Jepson-Wang/mini_agent_backend/internal/middleware"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/model"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/ratelimit"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/redislock"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/redisx"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/revoke"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/token"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/repository"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/service"
@@ -80,7 +82,11 @@ func main() {
 	}
 
 	repo := repository.New(db)
-	authSvc := service.NewAuthService(repo, tokenMgr)
+
+	// authSvc 要吊销能力,而吊销器依赖 Redis,Redis 在后面才初始化。
+	// 所以这里先建一个不带吊销的,等 Redis 好了再补上 —— 见下面
+	// 「Redis 就绪之后」那段。
+	authSvc := service.NewAuthService(repo, tokenMgr, nil)
 
 	// 下面这三行在拆一个构造环:
 	//
@@ -152,9 +158,28 @@ func main() {
 	var limiter middleware.Limiter
 	// RedisProber 同理:*redisx.Client 的方法虽然 nil 安全,但会把"没启用"报成 up。
 	var redisProber handler.RedisProber
+	// 吊销器同理:revoke.New(nil) 返回 nil,表示"这个部署没启用吊销"。
+	var revoker *revoke.Revoker
 	if rdb != nil {
 		limiter = ratelimit.New(rdb.Raw())
 		redisProber = rdb
+		revoker = revoke.New(rdb.Raw(), cfg.JWT.AccessTTL)
+	}
+
+	// 把吊销能力装进 authSvc。
+	//
+	// 用接口变量转一手,免得 revoker 为 nil 时把一个"有类型无值"的
+	// 接口塞进 service —— 那样 service 里的 `s.revoker == nil` 会判假,
+	// 然后在 nil 指针上炸。
+	var tokenRevoker service.TokenRevoker
+	var revokeChecker middleware.Revoker
+	if revoker != nil {
+		tokenRevoker = revoker
+		revokeChecker = revoker
+	}
+	authSvc = service.NewAuthService(repo, tokenMgr, tokenRevoker)
+	if revoker == nil {
+		slog.Warn("未启用 JWT 吊销(redis.addr 为空),登出的令牌在过期前仍然有效")
 	}
 
 	rl := cfg.RateLimit
@@ -185,10 +210,28 @@ func main() {
 
 	// 用 statusWriter(不带 Agent 客户端的那个)就够了:回收器只写状态,
 	// 从不联系 Agent —— 一个连不上的 Agent 正是它要处理的情况。
-	reconciler, err := service.NewReconciler(repo.Task, statusWriter, cfg.Reconcile)
+	//
+	// lock 是选主锁:多副本部署时只有拿到锁的那一个会扫,
+	// 别的直接跳过这一轮。没配 Redis 时是 nil,回收器照常工作。
+	//
+	// ★ 用接口类型的变量装,和上面的 limiter / redisProber 同一个理由:
+	// 把一个值为 nil 的 *redislock.Lock 直接赋给接口字段,得到的接口值
+	// 有类型、无值,不等于 nil。
+	var reconcileLock service.LeaseLock
+	if rdb != nil {
+		reconcileLock = redislock.New(rdb.Raw())
+	}
+
+	reconciler, err := service.NewReconciler(repo.Task, statusWriter, reconcileLock, cfg.Reconcile)
 	if err != nil {
 		fatal("初始化任务回收器失败", err)
 	}
+	// ★ 这里只许有两条分支:启用了就跑,没启用就说一声。
+	//
+	// 别再往中间插 `else if`。"没配 Redis 就没有选主"那条警告曾经插在这儿,
+	// 于是 REDIS_ADDR 为空(受支持的默认部署)时分支走到警告就结束了,
+	// go Run 永远到不了 —— 回收器被构造出来然后静静丢掉,任务永远停在 running。
+	// 那条警告现在由 Reconciler.Run 自己打,理由见它的注释。
 	if reconciler == nil {
 		slog.Warn("未启用任务回收器(reconcile.interval <= 0),卡住的任务不会被自动收尾")
 	} else {
@@ -219,12 +262,15 @@ func main() {
 	router := handler.NewRouter(handler.Deps{
 		DB: db,
 		// /health 拿它探 Agent。探不通只降级成 degraded,不 500。
-		Agent:         agentCli,
-		Auth:          authSvc,
-		Session:       sessionSvc,
-		Task:          taskSvc,
-		TaskCallback:  taskSvc,
-		Verifier:      tokenMgr,
+		Agent:        agentCli,
+		Auth:         authSvc,
+		Session:      sessionSvc,
+		Task:         taskSvc,
+		TaskCallback: taskSvc,
+		// 校验器要能返回完整声明(jti 和 iat),吊销检查需要它们。
+		// 用适配器包一层,免得 middleware 反过来依赖 token 包。
+		Verifier:      middleware.NewClaimsAdapter(tokenMgr),
+		Revoker:       revokeChecker,
 		InternalToken: cfg.Agent.CallbackSecret,
 		Debug:         debug,
 

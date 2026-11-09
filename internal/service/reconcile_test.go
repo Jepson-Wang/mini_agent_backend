@@ -38,7 +38,7 @@ func testReconcileCfg() config.Reconcile {
 
 func newTestReconciler(t *testing.T, l *fakeLister, w *fakeStatusWriter) *Reconciler {
 	t.Helper()
-	r, err := NewReconciler(l, w, testReconcileCfg())
+	r, err := NewReconciler(l, w, nil, testReconcileCfg())
 	if err != nil {
 		t.Fatalf("NewReconciler: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestNewReconciler_DisabledReturnsNil(t *testing.T) {
 	cfg := testReconcileCfg()
 	cfg.Interval = 0
 
-	r, err := NewReconciler(&fakeLister{}, newFakeStatusWriter(), cfg)
+	r, err := NewReconciler(&fakeLister{}, newFakeStatusWriter(), nil, cfg)
 	if err != nil {
 		t.Fatalf("关掉回收器不该报错: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestNewReconciler_RejectsBadConfig(t *testing.T) {
 		"batch 为 0":       {Interval: time.Minute, StaleAfter: time.Minute, Batch: 0},
 	}
 	for name, cfg := range bad {
-		if _, err := NewReconciler(&fakeLister{}, newFakeStatusWriter(), cfg); err == nil {
+		if _, err := NewReconciler(&fakeLister{}, newFakeStatusWriter(), nil, cfg); err == nil {
 			t.Errorf("%s:该报错", name)
 		}
 	}
@@ -209,7 +209,7 @@ func TestReconciler_RunStopsOnContextCancel(t *testing.T) {
 	cfg := testReconcileCfg()
 	cfg.Interval = 10 * time.Millisecond
 
-	r, err := NewReconciler(&fakeLister{}, newFakeStatusWriter(), cfg)
+	r, err := NewReconciler(&fakeLister{}, newFakeStatusWriter(), nil, cfg)
 	if err != nil {
 		t.Fatalf("NewReconciler: %v", err)
 	}

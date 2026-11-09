@@ -55,6 +55,13 @@ type Manager struct {
 
 	// now 可替换,测试里用来伪造时间验证过期行为,生产上就是 time.Now。
 	now func() time.Time
+
+	// newJTI 生成令牌的唯一标识。可替换,测试里用来模拟生成失败。
+	//
+	// **为什么现在必须成功**(以前失败就用空串):
+	// jti 是吊销的凭证 —— 没有 jti 的 token 吊销不掉,等于发了一张
+	// 注销不掉的卡。所以它是签发的必需项,不是可选的日志字段。
+	newJTI func() (string, error)
 }
 
 // NewManager 构造签发器。
@@ -76,6 +83,7 @@ func NewManager(secret, issuer string, ttl time.Duration) (*Manager, error) {
 		issuer: issuer,
 		ttl:    ttl,
 		now:    time.Now,
+		newJTI: ulid.New,
 	}, nil
 }
 
@@ -95,10 +103,20 @@ func (m *Manager) Issue(userID int64) (string, time.Time, error) {
 	now := m.now()
 	expiresAt := now.Add(m.ttl)
 
-	// jti 失败不影响签发 —— 它只用于日志追踪和将来做吊销名单,不是必需声明。
-	jti, err := ulid.New()
+	// jti 生成失败要让整个签发失败。
+	//
+	// 以前这里是「失败就用空串」,理由是它只用于日志追踪。
+	// 有了吊销机制之后这个理由不成立了:**没有 jti 的 token 吊销不掉** ——
+	// 你没有任何东西可以拿去写进黑名单,等于发了一张注销不掉的卡。
+	//
+	// 所以这里是硬失败:宁可这次登录失败让用户重试,也不能签出一个
+	// 永远收不回来的令牌。
+	jti, err := m.newJTI()
 	if err != nil {
-		jti = ""
+		return "", time.Time{}, fmt.Errorf("token: 生成 jti: %w", err)
+	}
+	if jti == "" {
+		return "", time.Time{}, errors.New("token: jti 不能为空")
 	}
 
 	claims := Claims{
@@ -123,7 +141,22 @@ func (m *Manager) Issue(userID int64) (string, time.Time, error) {
 //
 // ctx 现在用不上,留着是因为接口里有 —— 换成查 session 表或调认证服务的实现时
 // 必须能传超时下去。
-func (m *Manager) Verify(_ context.Context, tokenStr string) (int64, error) {
+func (m *Manager) Verify(ctx context.Context, tokenStr string) (int64, error) {
+	claims, err := m.VerifyClaims(ctx, tokenStr)
+	if err != nil {
+		return 0, err
+	}
+	return claims.UID, nil
+}
+
+// VerifyClaims 校验令牌并返回完整声明。
+//
+// 和 Verify 的区别只是返回得更多 —— 校验逻辑完全一致,**没有第二份实现**。
+// 吊销检查需要 jti 和 iat,而 Verify 只返回 userID,信息不够。
+//
+// 拆成两个方法而不是改 Verify 的签名:Verify 是 middleware.TokenVerifier
+// 接口的一部分,改了要动所有实现和调用方。留着一个薄方法更省事。
+func (m *Manager) VerifyClaims(_ context.Context, tokenStr string) (*Claims, error) {
 	var claims Claims
 
 	_, err := jwt.ParseWithClaims(tokenStr, &claims,
@@ -150,15 +183,27 @@ func (m *Manager) Verify(_ context.Context, tokenStr string) (int64, error) {
 		// 过期是最常见的一种,单独区分;其余全部归为非法。
 		// 原始 err 用 %v 拼进去只为了写日志,不会回给客户端(见 middleware.Auth)。
 		if errors.Is(err, jwt.ErrTokenExpired) {
-			return 0, fmt.Errorf("%w: %v", ErrExpiredToken, err)
+			return nil, fmt.Errorf("%w: %v", ErrExpiredToken, err)
 		}
-		return 0, fmt.Errorf("%w: %v", ErrInvalidToken, err)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
 
 	// 签名合法不代表载荷有意义:uid 可能压根没带,反序列化后就是零值。
 	// 不拦的话下游会拿着 userID=0 去查数据。
 	if claims.UID <= 0 {
-		return 0, fmt.Errorf("%w: uid 缺失或非法", ErrInvalidToken)
+		return nil, fmt.Errorf("%w: uid 缺失或非法", ErrInvalidToken)
 	}
-	return claims.UID, nil
+
+	// jti 必须有。
+	//
+	// 没有 jti 的 token 吊销不掉 —— 校验侧放行它,就等于给了一份
+	// 永远收不回来的凭证。所以这里拒绝。
+	//
+	// 这条会让**升级前签出的老令牌全部失效**,强制所有人重新登录一次。
+	// 这是有意的部署决策,不是 bug:发版说明里必须写清楚。
+	if claims.ID == "" {
+		return nil, fmt.Errorf("%w: jti 缺失", ErrInvalidToken)
+	}
+
+	return &claims, nil
 }

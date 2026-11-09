@@ -81,7 +81,7 @@ func withAuthSvc(t *testing.T, fn func(t *testing.T, s *AuthService, r *reposito
 	t.Helper()
 	r := withTx(t)
 	iss := &fakeIssuer{}
-	fn(t, NewAuthService(r, iss), r, iss)
+	fn(t, NewAuthService(r, iss, nil), r, iss)
 }
 
 // ---- 会话 ----

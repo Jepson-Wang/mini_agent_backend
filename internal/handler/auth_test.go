@@ -34,6 +34,11 @@ type fakeAuth struct {
 	gotEmail    string
 	gotPassword string
 	gotNickname string
+
+	// logout 的调用记录。
+	gotLogoutJTI string
+	gotLogoutExp time.Time
+	logoutErr    error
 }
 
 func (f *fakeAuth) Register(_ context.Context, email, password, nickname string) (*service.Credential, error) {
@@ -44,6 +49,13 @@ func (f *fakeAuth) Register(_ context.Context, email, password, nickname string)
 func (f *fakeAuth) Login(_ context.Context, email, password string) (*service.Credential, error) {
 	f.gotEmail, f.gotPassword = email, password
 	return f.cred, f.err
+}
+
+// Logout 记下吊销的是哪个令牌。
+func (f *fakeAuth) Logout(_ context.Context, jti string, exp time.Time) error {
+	f.gotLogoutJTI = jti
+	f.gotLogoutExp = exp
+	return f.logoutErr
 }
 
 func okCredential() *service.Credential {

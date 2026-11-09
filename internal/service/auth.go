@@ -23,6 +23,16 @@ type TokenIssuer interface {
 	Issue(userID int64) (token string, expiresAt time.Time, err error)
 }
 
+// TokenRevoker 吊销一个访问令牌。
+//
+// 生产实现是 pkg/revoke.Revoker。为 nil 时登出退化成"什么也不做" ——
+// 那个部署没启用吊销,令牌还能用到过期。
+type TokenRevoker interface {
+	// RevokeToken 把 jti 加进黑名单。exp 是令牌的过期时刻,
+	// 黑名单的 TTL 取 exp - now。
+	RevokeToken(ctx context.Context, jti string, exp time.Time) error
+}
+
 // Credential 是一份登录态:用户本人 + 一个能代表他的令牌。
 type Credential struct {
 	User      *model.User
@@ -33,14 +43,43 @@ type Credential struct {
 // statusActive 是允许登录的账号状态,和 model.User.Status 的默认值一致。
 const statusActive = "active"
 
-// AuthService 负责注册和登录。
+// AuthService 负责注册、登录和登出。
 type AuthService struct {
 	repo   *repository.Repository
 	tokens TokenIssuer
+
+	// revoker 吊销令牌。**为 nil 时登出不做任何事** ——
+	// 那个部署没启用吊销功能(没配 Redis),令牌还能用到过期。
+	revoker TokenRevoker
 }
 
-func NewAuthService(repo *repository.Repository, tokens TokenIssuer) *AuthService {
-	return &AuthService{repo: repo, tokens: tokens}
+func NewAuthService(repo *repository.Repository, tokens TokenIssuer, revoker TokenRevoker) *AuthService {
+	return &AuthService{repo: repo, tokens: tokens, revoker: revoker}
+}
+
+// Logout 吊销当前这一个令牌。
+//
+// **只吊销当前令牌,不动该用户的其它令牌。**
+// 用户在手机上还登着,不该被这一次的登出踢下线 ——
+// 整用户吊销是"改密码"和"禁用账号"才该做的事。
+//
+// revoker 为 nil(没启用吊销)时这是个**成功的空操作**:
+// 前端照样清掉本地 token,服务端这边没有可吊销的东西。
+// 返回 error 反而会让前端弹一个"登出失败",而实际上什么都没出错。
+func (s *AuthService) Logout(ctx context.Context, jti string, exp time.Time) error {
+	if s == nil || s.revoker == nil {
+		return nil
+	}
+	if jti == "" {
+		// 取不到 jti 说明这个校验器没实现 ClaimsVerifier,
+		// 也就是拿不到吊销的凭证。这不是错误 —— 只是这个部署没法吊销。
+		slog.Warn("登出时取不到 jti,无法吊销令牌")
+		return nil
+	}
+	if err := s.revoker.RevokeToken(ctx, jti, exp); err != nil {
+		return fmt.Errorf("service: 吊销令牌失败: %w", err)
+	}
+	return nil
 }
 
 // Register 注册一个新用户,并直接返回登录态。
