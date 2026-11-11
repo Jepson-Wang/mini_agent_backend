@@ -2,8 +2,10 @@ package middleware_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -279,3 +281,59 @@ func (v *plainVerifier) Verify(context.Context, string) (int64, error) { return 
 
 // 编译期钉住:token.Manager 满足 middleware.TokenVerifier。
 var _ middleware.TokenVerifier = (*token.Manager)(nil)
+
+// nilClaimsVerifier 实现了 ClaimsVerifier,但返回 (nil, nil) ——
+// 既不给声明,也不报错。
+//
+// 这不是臆造的形状:verifyClaims 里**明确**有一条
+//
+//	if claims == nil { return nil, nil }
+//
+// 的分支,所以这是接口契约允许的返回值。一个测试替身、或者将来某个
+// 查 session 表的校验器(查不到就返回 nil 而忘了带 error)都会这样。
+type nilClaimsVerifier struct{ calls int }
+
+func (v *nilClaimsVerifier) Verify(context.Context, string) (int64, error) {
+	v.calls++
+	return 0, nil
+}
+
+func (v *nilClaimsVerifier) VerifyClaims(context.Context, string) (*middleware.TokenClaims, error) {
+	v.calls++
+	return nil, nil
+}
+
+// ★ 校验器返回空声明时必须 fail closed 返回 500,不能 panic。
+//
+// 原来的代码在吊销那一段守了 claims != nil,紧接着的
+// c.Set(userIDKey, claims.UserID) 却是无条件解引用 —— 于是这样的实现会让
+// **每个鉴权请求 panic**,被 Recovery 兜成 500。结果长得像服务故障,
+// 而实际是接线 bug,排查方向一开始就会走偏。
+//
+// 为什么是 500 而不是 401:按仓库惯例,依赖没接好一律 fail closed 500。
+// 回 401 会把「代码接错了」伪装成「用户的令牌不对」,那是更难查的形态。
+func TestAuth_NilClaimsFailsClosed(t *testing.T) {
+	v := &nilClaimsVerifier{}
+	r := newClaimsEngine(v, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/me", nil)
+	req.Header.Set("Authorization", "Bearer whatever")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, 期望 500(依赖没接好要 fail closed)", w.Code)
+	}
+
+	var got response.Response
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("解响应: %v", err)
+	}
+	if got.Code != response.CodeInternal {
+		t.Errorf("code = %d, 期望 %d", got.Code, response.CodeInternal)
+	}
+	// 文案不能把内部细节漏出去。
+	if strings.Contains(got.Message, "claims") || strings.Contains(got.Message, "声明") {
+		t.Errorf("响应文案泄露了内部细节: %q", got.Message)
+	}
+}

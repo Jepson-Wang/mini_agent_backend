@@ -105,7 +105,24 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	// (也就是没启用吊销)。那就不吊销,直接回成功 ——
 	// 前端照样清本地 token,服务端这边没有可吊销的东西。
 	jti, _ := middleware.TokenJTI(c)
-	exp, _ := middleware.TokenExpiresAt(c)
+	exp, expOK := middleware.TokenExpiresAt(c)
+
+	// ★ 有 jti 却取不到 exp 是接线错误,不能静静当成功。
+	//
+	// Logout → RevokeToken 的 TTL 是按 exp 算的。exp 是零值的话 TTL 会是一个
+	// 巨大的负数,RevokeToken 直接 return nil —— 接口回 200 说"登出成功",
+	// 而那个 token 在剩下的有效期里照样能用。这正是 pkg/revoke 包注释里
+	// 点名的"吊销静默失效"。
+	//
+	// 不 fail closed(登出失败对用户没有可操作性,前端照样该清本地 token),
+	// 但必须留下痕迹 —— service 那边对缺 jti 已经有一条 Warn,这里补齐另一半,
+	// 否则两个分支一个有声一个没声,排查时只会看到"登出明明成功了"。
+	if jti != "" && !expOK {
+		slog.Error("登出时取不到令牌过期时刻,无法计算黑名单 TTL,本次吊销未生效",
+			"trace_id", trace.FromGin(c),
+			"提示", "middleware.Auth 只在 ExpiresAt 非零时才写入,校验器可能没填 exp",
+		)
+	}
 
 	if err := h.svc.Logout(c.Request.Context(), jti, exp); err != nil {
 		// 原始 err 进日志,不进响应体。

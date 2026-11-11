@@ -163,7 +163,7 @@ func main() {
 	if rdb != nil {
 		limiter = ratelimit.New(rdb.Raw())
 		redisProber = rdb
-		revoker = revoke.New(rdb.Raw(), cfg.JWT.AccessTTL)
+		revoker = revoke.New(rdb.Raw(), cfg.JWT.AccessTTL, token.Leeway)
 	}
 
 	// 把吊销能力装进 authSvc。

@@ -133,7 +133,7 @@ func TestVerify_NotExpiredWithinLeeway(t *testing.T) {
 
 	m.now = time.Now
 	if _, err := m.Verify(context.Background(), tok); err != nil {
-		t.Fatalf("偏差 5s(容忍 %v)不该被拒: %v", leeway, err)
+		t.Fatalf("偏差 5s(容忍 %v)不该被拒: %v", Leeway, err)
 	}
 }
 

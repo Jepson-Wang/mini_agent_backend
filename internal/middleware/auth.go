@@ -121,8 +121,28 @@ func Auth(v TokenVerifier, revoker Revoker) gin.HandlerFunc {
 			return
 		}
 
+		// ★ claims 为 nil 是**接线错误**,必须 fail closed。
+		//
+		// verifyClaims 对一个 ClaimsVerifier 返回了 nil claims 且无 error 时
+		// 会原样返回 (nil, nil) —— 下面那段吊销检查守了 claims != nil,
+		// 紧接着的 c.Set(userIDKey, claims.UserID) 却是无条件解引用,
+		// 于是任何这样的实现(测试替身、将来查 session 表的校验器)会让
+		// **每个鉴权请求 panic**,被 Recovery 兜成 500 —— 看起来像服务故障,
+		// 而实际是接线 bug,排查方向会一开始就走偏。
+		//
+		// 按仓库惯例:依赖没接好一律 500,不放行、不 panic、也不退化成 401
+		// (401 会把"代码接错了"伪装成"用户的令牌不对")。
+		if claims == nil {
+			slog.Error("令牌校验器返回了空声明,拒绝所有请求",
+				"trace_id", trace.FromGin(c),
+				"path", c.Request.URL.Path,
+			)
+			response.Fail(c, response.CodeInternal, "")
+			return
+		}
+
 		// 吊销检查。
-		if revoker != nil && claims != nil && claims.JTI != "" {
+		if revoker != nil && claims.JTI != "" {
 			revoked, err := revoker.IsRevoked(c.Request.Context(), claims.JTI,
 				claims.UserID, claims.IssuedAt)
 			if err != nil {

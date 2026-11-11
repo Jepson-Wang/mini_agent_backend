@@ -23,9 +23,16 @@ import (
 // 而且 Verify 里的白名单也要跟着改 —— 那份白名单是安全边界,不是可选项。
 const signingAlg = "HS256"
 
-// leeway 允许的时钟偏差。签发方和校验方是同一个进程时用不上,
+// Leeway 允许的时钟偏差。签发方和校验方是同一个进程时用不上,
 // 但多实例部署时机器间差几秒很常见,不留余量会出现"刚签出来就说没生效"。
-const leeway = 30 * time.Second
+//
+// **导出是刻意的,因为吊销那一侧必须知道这个值。** 校验带着这个余量,
+// 意味着一个 token 到 exp + Leeway 之前都还验得过;而黑名单的 TTL 如果
+// 只算到 exp,中间那段时间里 token 有效、黑名单却已经没了 —— 登出静默失效。
+// 让调用方从这里取、显式传进 revoke.New,这个耦合就是看得见的;
+// 在 revoke 里另抄一个 30s 常量的话,这边一改那边就静默失效,
+// 而那正是上面说的那个 bug 的同一个形态。
+const Leeway = 30 * time.Second
 
 var (
 	// ErrInvalidToken 令牌不合法:格式错、签名不对、签发方不匹配、uid 缺失等。
@@ -176,7 +183,7 @@ func (m *Manager) VerifyClaims(_ context.Context, tokenStr string) (*Claims, err
 		jwt.WithIssuer(m.issuer),
 
 		jwt.WithIssuedAt(),
-		jwt.WithLeeway(leeway),
+		jwt.WithLeeway(Leeway),
 		jwt.WithTimeFunc(m.now),
 	)
 	if err != nil {

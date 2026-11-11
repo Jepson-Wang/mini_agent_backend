@@ -120,7 +120,7 @@ repository 数据访问,负责把 gorm/驱动错误翻译成 model.Err*
 
 - **配额链路断在任何一环,表现都是 500**:`TaskQuota` → `ErrTaskQuotaExceeded` → `errRules` → 42900。掉进"没登记 → 50000"的默认分支时,客户端会把它当成"服务坏了"去重试,恰好是超配额时最不该做的事。`TestFailFromError_QuotaExceeded` 盯着这条。
 
-对应的测试删了就会出问题（**打 ★ 的五条没有 `TEST_DSN` 就不会跑**，所以别把 `ALLOW_SKIP_DB=1` 当默认姿势）：★`TestLogin_FailuresAreIndistinguishable`、★`TestLogin_DisabledUser`、`TestUserResp_NoEmbeddedStruct`、`TestRegister_ValidationLeaksNothing`、`TestAuth_NilServiceFailsClosed`、★`TestCancel_OtherUsersTaskLooksMissing`、★`TestCancel_LateCallbackCannotRevive`、★`TestHandleCallback_RejectsCanceled`、`TestCallback_RequiresSecret`、`TestCallback_NoSecretConfiguredFailsClosed`、`TestTranslateGRPCError_DropsRawMessage`、`TestHealth_ProbeErrorNotEchoed`、`TestReconcile_NeverWritesCanceled`、`TestFailFromError_QuotaExceeded`、`TestFailFromError_UnknownErrorLeaksNothing`、`TestLoad_WireSecretsMustBeASCII`、`TestOnEvent_ErrorCarriesOnlyErrorMsg`、`TestAllow_NarrowBucketRejectDoesNotConsumeGlobal`、`TestAllow_FixedWindowBoundaryBurstIsRejected`、`TestAllow_SameMillisecondAttemptsAllCount`、`TestAllow_ZeroLimitBucketIsSkipped`、`TestAllow_RetryAfterIsWindowNotRemaining`、`TestAuthRateLimit_OversizedBodyIsRejected`、`TestAuthRateLimit_UsesRemoteAddrNotXFF`、`TestAuthRateLimit_RejectionDoesNotRevealDimension`、`TestAuthRateLimit_EmailKeyIsHMACNotPlaintext`、`TestChatRateLimit_MissingUserIDFailsClosed`、`TestLogin_RateLimitedResponseIsIdenticalForUnknownEmail`、`TestNew_SetsExplicitTimeouts`、`TestHealth_RedisProbeErrorNotEchoed`。
+对应的测试删了就会出问题（**打 ★ 的五条没有 `TEST_DSN` 就不会跑**，所以别把 `ALLOW_SKIP_DB=1` 当默认姿势）：★`TestLogin_FailuresAreIndistinguishable`、★`TestLogin_DisabledUser`、`TestUserResp_NoEmbeddedStruct`、`TestRegister_ValidationLeaksNothing`、`TestAuth_NilServiceFailsClosed`、★`TestCancel_OtherUsersTaskLooksMissing`、★`TestCancel_LateCallbackCannotRevive`、★`TestHandleCallback_RejectsCanceled`、`TestCallback_RequiresSecret`、`TestCallback_NoSecretConfiguredFailsClosed`、`TestTranslateGRPCError_DropsRawMessage`、`TestHealth_ProbeErrorNotEchoed`、`TestReconcile_NeverWritesCanceled`、`TestFailFromError_QuotaExceeded`、`TestFailFromError_UnknownErrorLeaksNothing`、`TestLoad_WireSecretsMustBeASCII`、`TestOnEvent_ErrorCarriesOnlyErrorMsg`、`TestAllow_NarrowBucketRejectDoesNotConsumeGlobal`、`TestAllow_FixedWindowBoundaryBurstIsRejected`、`TestAllow_SameMillisecondAttemptsAllCount`、`TestAllow_ZeroLimitBucketIsSkipped`、`TestAllow_RetryAfterIsWindowNotRemaining`、`TestAuthRateLimit_OversizedBodyIsRejected`、`TestAuthRateLimit_UsesRemoteAddrNotXFF`、`TestAuthRateLimit_RejectionDoesNotRevealDimension`、`TestAuthRateLimit_EmailKeyIsHMACNotPlaintext`、`TestChatRateLimit_MissingUserIDFailsClosed`、`TestLogin_RateLimitedResponseIsIdenticalForUnknownEmail`、`TestNew_SetsExplicitTimeouts`、`TestHealth_RedisProbeErrorNotEchoed`、`TestRevokeToken_TTLIncludesVerifyLeeway`、`TestRevokeUser_TokenFromNextSecondSurvives`、`TestRevokeUser_TokenFromSameSecondIsRevoked`、`TestRevokeUser_StoredNotBeforeIsWholeSecondMillis`、`TestAuth_NilClaimsFailsClosed`、`TestRun_NilLockStillScans`、`TestRelease_OnlyOwnLock`。
 
 ## 任务的最终答复
 
@@ -167,7 +167,8 @@ HTTP 回调那条路由 `dto.TaskCallbackReq.Output` 的 `max` 挡着,两条汇�
 
 以前登出是**纯前端行为** —— 前端删掉本地 token,那个 token 在服务端仍然有效,直到 `AccessTTL`(默认 2 小时)过期。两个真实后果:用户改密码后攻击者手里的 token 还能用 2 小时;**管理员禁用一个用户之后,他现有的 token 还能用 2 小时**。第二条是实打实的安全洞,而且藏得深 —— 禁用检查只在 `Login` 里,`middleware.Auth` 一次库都不查。
 
-`internal/pkg/revoke` 补上了这一层。
+`internal/pkg/revoke` 补上了这一层 —— 但**只补上了第一条**。第二条(禁用账号)
+到今天仍然是开着的,因为 `RevokeUser` 没有任何生产调用方,理由见下面那张表下面的 ★。
 
 **`jti` 现在是签发必需项,生成失败要让 `Issue` 失败。** 之前它是「失败就用空串」,因为只用于日志。有了黑名单之后那个理由不成立了:**没有 jti 的 token 吊销不掉** —— 你没有任何东西可以拿去写进黑名单,等于发了一张注销不掉的卡。`Verify` 侧同样拒绝无 jti 的 token,这会让升级前签出的老令牌全部失效,**是有意的部署决策**,发版说明里要写「所有用户需重新登录」。
 
@@ -175,14 +176,32 @@ HTTP 回调那条路由 `dto.TaskCallbackReq.Output` 的 `max` 挡着,两条汇�
 
 | 场景 | 吊销什么 | 用哪种 |
 |---|---|---|
-| 登出 | 只有当前这一个令牌 | 单 token 黑名单(按 jti) |
-| 改密码 / 禁用账号 | 该用户全部令牌,包括你不知道存在的 | 用户级 `not_before`(按 user_id) |
+| 登出 | 只有当前这一个令牌 | 单 token 黑名单(按 jti) | **已接线** |
+| 改密码 / 禁用账号 | 该用户全部令牌,包括你不知道存在的 | 用户级 `not_before`(按 user_id) | **只有能力,没接线** |
+
+★ **第二行目前只是"能力齐备",不是"洞补上了"。** `Revoker.RevokeUser` 写好了也测了,
+但**全仓库没有任何生产代码调它**(只有 `revoke_test.go`)—— 既没有禁用用户的接口,
+也没有改密码的接口。所以「管理员禁用一个用户之后他的 token 还能用 2 小时」这个洞
+**和做这一层之前完全一样,仍然开着**。别把这一节读成"禁用已经生效了"。
+要补齐得先有那两个接口,然后在它们里面调 `RevokeUser`。
 
 黑名单单独用不够:禁用用户时你手里没有他的 jti —— jti 只在他自己的 token 里,没法枚举「这个用户有哪些令牌在外面」。用户级单独用也不够:它是全有或全无,用它做登出会把该用户所有设备都踢下线。
 
-**黑名单的 TTL 必须等于 token 剩余有效期(`exp - now`)。** 短了吊销静默失效(用户以为登出了,其实没有),长了纯泄内存,`<= 0` 时根本不该写(那个 token 已经过期,JWT 校验会拒它)。这是 Redis 最漂亮的用法:**key 的生命周期和业务对象的生命周期完全对齐,垃圾回收交给 Redis,不需要任何清理任务。** 换成数据库表就得自己写定时任务删过期行,那套问题这个项目已经在 `Reconciler` 上踩过一遍了。`TestRevokeToken_TTLMatchesExpiry` 盯着这条。
+**黑名单的 TTL 必须是 `exp - now + token.Leeway`,不是 `exp - now`。** 短了吊销静默失效(用户以为登出了,其实没有),长了纯泄内存。那个 `Leeway` 不能省:校验侧带着 `jwt.WithLeeway(token.Leeway)`(30s),一个 token 到 `exp + 30s` 之前都还验得过;TTL 只算到 `exp` 的话,中间那 30 秒里 token 有效、黑名单却已经被 Redis 回收 —— 临近过期时登出完全无效,而且没有任何迹象。同理 `ttl <= 0` 那个短路也要带余量,所以"在 `exp` 之后几秒登出"仍然会写黑名单,那恰恰是最该写的时刻。
+
+**`token.Leeway` 导出是刻意的**:让 `revoke` 从那里取、由 `main.go` 显式传进 `revoke.New`,这个耦合就是看得见的。在 `revoke` 里另抄一个 30s 常量的话,`token` 那边一改这边就静默失效 —— 那正是上面这个 bug 的同一个形态。
+
+这仍然是 Redis 最漂亮的用法:**key 的生命周期和业务对象的生命周期对齐,垃圾回收交给 Redis,不需要任何清理任务。** 换成数据库表就得自己写定时任务删过期行,那套问题这个项目已经在 `Reconciler` 上踩过一遍了。`TestRevokeToken_TTLIncludesVerifyLeeway` 和 `TestRevokeToken_SurvivesDuringLeeway` 盯着这条。
 
 **用户级比较的方向不能反**:`token.iat < not_before` 才算被吊销。写反的话用户改完密码之后新登录的令牌也立刻失效,表现是「登录成功但马上又被踢」的死循环,单用户手工测试时很难第一时间联想到吊销逻辑。`TestRevokeUser_DoesNotAffectNewerTokens` 盯着这条。
+
+**`not_before` 必须向上取整到整秒,而且存储格式保持毫秒。** 这是个容易被漏掉的精度坑:JWT 的 `iat` 只有**秒**精度(golang-jwt 的 `NewNumericDate` 做 `t.Truncate(TimePrecision)`,默认 1 秒),毫秒位恒为 0;而 `not_before` 原来存真毫秒。于是吊销发生在 `12:00:05.200` 时 `nbf = ...5200`,同一秒内重新登录拿到的新令牌 `iat` 被截断成 `...5000` —— `5000 < 5200`,刚签出来的票被判吊销,表现就是上一条警告的那个死循环,只是成因是精度不是方向。
+
+取整方向是**安全决策**,这个精度下没有两全:向下取整的话那一秒内签发的票 `iat` 恰好**等于** `nbf`,而判据是 `<`,于是它永远不算被吊销 —— 代价不是多活一秒,是**多活它自己完整的 `AccessTTL`(2 小时)**。向上取整只是让那一秒内的重新登录白跑一趟。按后果的不对称选向上。所以这个修法不是消除"刚签出来就被判吊销",而是把它从"毫秒位决定、看起来随机"收敛成"同一秒内必然、下一秒必然恢复"。
+
+**格式不许改成秒**:滚动发布期间 Redis 里还躺着旧的毫秒值,按秒解析会得到一个巨大的数字,瞬间把所有人判成已吊销 —— 而那些 key 的 TTL 是 2 小时,窗口足够长。`TestRevokeUser_TokenFromNextSecondSurvives`、`TestRevokeUser_TokenFromSameSecondIsRevoked`、`TestRevokeUser_StoredNotBeforeIsWholeSecondMillis` 盯着这三条。
+
+**`middleware.Auth` 拿到空声明要 fail closed 500。** `verifyClaims` 对一个 `ClaimsVerifier` 返回了 nil 声明且无 error 时会原样返回 `(nil, nil)` —— 那是接口契约允许的返回值(查不到就返回 nil 而忘了带 error 的实现很常见)。不挡的话紧接着的 `c.Set(userIDKey, claims.UserID)` 会**让每个鉴权请求 panic**,被 `Recovery` 兜成 500:看起来像服务故障,实际是接线 bug,排查方向一开始就走偏。回 401 也不行 —— 那是把「代码接错了」伪装成「用户的令牌不对」。`TestAuth_NilClaimsFailsClosed` 盯着这条。
 
 **吊销检查 fail open,但 `Verifier == nil` 仍然 fail closed。** 判据是**「前一道防线还在不在」**:`Verifier` 是身份校验本身,没了就是裸奔(fail closed);吊销是在一个**签名已经验过**的身份上再加一层,它失灵不代表身份可疑(fail open)。两个方向相反,而且必须相反。
 
@@ -192,7 +211,7 @@ HTTP 回调那条路由 `dto.TaskCallbackReq.Output` 的 `max` 挡着,两条汇�
 
 已知缺口:**没有 refresh token**,所以 `AccessTTL` 只能保持在 2h 这个体验可接受的值上,Redis 挂掉时吊销真空期的上界就是 2h。要缩短必须先做 refresh token(存储、轮转、重用检测、撤销链),那是独立的一块 —— 半做一个比不做更糟。
 
-对应的测试:`TestVerify_RejectsTokenWithoutJTI`、`TestRevokeToken_TTLMatchesExpiry`、`TestRevokeUser_DoesNotAffectNewerTokens`、`TestAuth_RevokedTokenRejected`、`TestAuth_RevokedMessageIsGeneric`、`TestAuth_RevokerErrorAllows`、`TestLogout_RevokesCurrentToken`。
+对应的测试:`TestVerify_RejectsTokenWithoutJTI`、`TestRevokeToken_TTLIncludesVerifyLeeway`、`TestRevokeToken_SurvivesDuringLeeway`、`TestRevokeUser_DoesNotAffectNewerTokens`、`TestRevokeUser_TokenFromNextSecondSurvives`、`TestRevokeUser_TokenFromSameSecondIsRevoked`、`TestRevokeUser_StoredNotBeforeIsWholeSecondMillis`、`TestAuth_NilClaimsFailsClosed`、`TestAuth_RevokedTokenRejected`、`TestAuth_RevokedMessageIsGeneric`、`TestAuth_RevokerErrorAllows`、`TestLogout_RevokesCurrentToken`。
 
 ## 限流
 
@@ -565,4 +584,4 @@ TaskService ──要──> agentclient.Client ──要──> EventHandler �
 
 回收器复用那个**不带客户端**的 `statusWriter`：它只写状态，从不联系 Agent —— 一个连不上的 Agent 正是它要处理的情况。它跑在自己的 `context.WithCancel` 上（不是请求 ctx），退出时先 `stopReconcile()` 再 `srv.Shutdown()`：它是纯后台循环，没有在途请求要照顾，让它在关闭过程中再扫一轮只会拖长关闭时间。
 
-已知未做：Agent 挂掉时**没有任何 HTTP 接口回 503**（`50300` / `50400` 的映射已经登记好，但派发失败走「标 failed + 200」、取消通知是 best-effort，两条路都不往上抛）；**限流只在配了 `REDIS_ADDR` 的部署里存在**（没配的话登录注册和建任务三条路全是裸的，只有启动时一条 Warn 兜着，见「限流」一节）；**回收器的选主和 JWT 吊销也都依赖 Redis**（没配 `REDIS_ADDR` 时没有锁，多副本会重复扫同一批任务 —— 靠 `cas` 兜底不会写错，只是白烧几次查询；吊销也不生效，被登出/禁用的令牌还能用到过期。两条都是启动时一条 Warn 兜着，见「JWT 吊销」和「心跳与回收器」那节）；**没有并发信号量**（限流挡突发不挡并发 —— `agentclient` 至今没有并发上限，稳定 5/s 持续半小时就是 9000 个在跑的任务；配额管总量、限流管速率、信号量管并发，三者不能互相替代）；**没有 refresh token**（所以 `AccessTTL` 停在 2h，见「JWT 吊销」那节）；`Login` 里"用户不存在"分支比"口令错"少跑一次 bcrypt，存在约 160ms 的时间侧信道（代码注释里写明了）；`/internal` 目前和业务接口共用一个监听端口，生产上应该单独端口或由网关按前缀挡在公网外。
+已知未做：Agent 挂掉时**没有任何 HTTP 接口回 503**（`50300` / `50400` 的映射已经登记好，但派发失败走「标 failed + 200」、取消通知是 best-effort，两条路都不往上抛）；**限流只在配了 `REDIS_ADDR` 的部署里存在**（没配的话登录注册和建任务三条路全是裸的，只有启动时一条 Warn 兜着，见「限流」一节）；**回收器的选主和 JWT 吊销也都依赖 Redis**（没配 `REDIS_ADDR` 时没有锁，多副本会重复扫同一批任务 —— 靠 `cas` 兜底不会写错，只是白烧几次查询；吊销也不生效，被登出/禁用的令牌还能用到过期。两条都是启动时一条 Warn 兜着，见「JWT 吊销」和「心跳与回收器」那节）；**没有并发信号量**（限流挡突发不挡并发 —— `agentclient` 至今没有并发上限，稳定 5/s 持续半小时就是 9000 个在跑的任务；配额管总量、限流管速率、信号量管并发，三者不能互相替代）；**「禁用账号」这个洞仍然开着**（`revoke.RevokeUser` 写好也测了，但**没有任何生产代码调它** —— 既没有禁用用户的接口也没有改密码的接口，所以管理员把一个用户改成 disabled 之后，他现有的令牌照样能用到 `AccessTTL` 过期，和做吊销这一层之前完全一样。补齐的前提是先有那两个接口，见「JWT 吊销」一节那张表下面的 ★）；**没有 refresh token**（所以 `AccessTTL` 停在 2h，见「JWT 吊销」那节）；`Login` 里"用户不存在"分支比"口令错"少跑一次 bcrypt，存在约 160ms 的时间侧信道（代码注释里写明了）；`/internal` 目前和业务接口共用一个监听端口，生产上应该单独端口或由网关按前缀挡在公网外。
