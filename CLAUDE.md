@@ -120,7 +120,9 @@ repository 数据访问,负责把 gorm/驱动错误翻译成 model.Err*
 
 - **配额链路断在任何一环,表现都是 500**:`TaskQuota` → `ErrTaskQuotaExceeded` → `errRules` → 42900。掉进"没登记 → 50000"的默认分支时,客户端会把它当成"服务坏了"去重试,恰好是超配额时最不该做的事。`TestFailFromError_QuotaExceeded` 盯着这条。
 
-对应的测试删了就会出问题（**打 ★ 的五条没有 `TEST_DSN` 就不会跑**，所以别把 `ALLOW_SKIP_DB=1` 当默认姿势）：★`TestLogin_FailuresAreIndistinguishable`、★`TestLogin_DisabledUser`、`TestUserResp_NoEmbeddedStruct`、`TestRegister_ValidationLeaksNothing`、`TestAuth_NilServiceFailsClosed`、★`TestCancel_OtherUsersTaskLooksMissing`、★`TestCancel_LateCallbackCannotRevive`、★`TestHandleCallback_RejectsCanceled`、`TestCallback_RequiresSecret`、`TestCallback_NoSecretConfiguredFailsClosed`、`TestTranslateGRPCError_DropsRawMessage`、`TestHealth_ProbeErrorNotEchoed`、`TestReconcile_NeverWritesCanceled`、`TestFailFromError_QuotaExceeded`、`TestFailFromError_UnknownErrorLeaksNothing`、`TestLoad_WireSecretsMustBeASCII`、`TestOnEvent_ErrorCarriesOnlyErrorMsg`、`TestAllow_NarrowBucketRejectDoesNotConsumeGlobal`、`TestAllow_FixedWindowBoundaryBurstIsRejected`、`TestAllow_SameMillisecondAttemptsAllCount`、`TestAllow_ZeroLimitBucketIsSkipped`、`TestAllow_RetryAfterIsWindowNotRemaining`、`TestAuthRateLimit_OversizedBodyIsRejected`、`TestAuthRateLimit_UsesRemoteAddrNotXFF`、`TestAuthRateLimit_RejectionDoesNotRevealDimension`、`TestAuthRateLimit_EmailKeyIsHMACNotPlaintext`、`TestChatRateLimit_MissingUserIDFailsClosed`、`TestLogin_RateLimitedResponseIsIdenticalForUnknownEmail`、`TestNew_SetsExplicitTimeouts`、`TestHealth_RedisProbeErrorNotEchoed`、`TestRevokeToken_TTLIncludesVerifyLeeway`、`TestRevokeUser_TokenFromNextSecondSurvives`、`TestRevokeUser_TokenFromSameSecondIsRevoked`、`TestRevokeUser_StoredNotBeforeIsWholeSecondMillis`、`TestAuth_NilClaimsFailsClosed`、`TestRun_NilLockStillScans`、`TestRelease_OnlyOwnLock`。
+- **「执行器满了」不是「执行器坏了」**:Agent 侧的并发护栏超限时用 gRPC 的 `RESOURCE_EXHAUSTED` 拒绝,backend 把它归到**独立的** `agentclient.ErrAgentBusy`(不并进 `ErrUnavailable`),**不得**算进 `countsAsUnhealthy`。熔断器数的是「持续出错」,不是「接不了活」—— 算进去的话,一次流量高峰(5 次拒绝就够 `breaker_threshold`)就能把一个**完全健康**的 Agent 整个隔离掉;而 Agent 恰恰是在满载的时候最忙,把它摘掉只会让剩下的任务更堵,于是更多请求被拒 —— 自己把自己推向更满。用户看到的文案也必须分开:「并发任务数已达上限」而不是「连接中断」。`TestCountsAsUnhealthy_AgentBusyIsNotUnhealthy`、`TestTranslateGRPCError_ResourceExhaustedIsBusy`、`TestOnStreamError_AgentBusyMessage` 盯着这条。
+
+对应的测试删了就会出问题（**打 ★ 的五条没有 `TEST_DSN` 就不会跑**，所以别把 `ALLOW_SKIP_DB=1` 当默认姿势）：★`TestLogin_FailuresAreIndistinguishable`、★`TestLogin_DisabledUser`、`TestUserResp_NoEmbeddedStruct`、`TestRegister_ValidationLeaksNothing`、`TestAuth_NilServiceFailsClosed`、★`TestCancel_OtherUsersTaskLooksMissing`、★`TestCancel_LateCallbackCannotRevive`、★`TestHandleCallback_RejectsCanceled`、`TestCallback_RequiresSecret`、`TestCallback_NoSecretConfiguredFailsClosed`、`TestTranslateGRPCError_DropsRawMessage`、`TestHealth_ProbeErrorNotEchoed`、`TestReconcile_NeverWritesCanceled`、`TestFailFromError_QuotaExceeded`、`TestFailFromError_UnknownErrorLeaksNothing`、`TestLoad_WireSecretsMustBeASCII`、`TestOnEvent_ErrorCarriesOnlyErrorMsg`、`TestAllow_NarrowBucketRejectDoesNotConsumeGlobal`、`TestAllow_FixedWindowBoundaryBurstIsRejected`、`TestAllow_SameMillisecondAttemptsAllCount`、`TestAllow_ZeroLimitBucketIsSkipped`、`TestAllow_RetryAfterIsWindowNotRemaining`、`TestAuthRateLimit_OversizedBodyIsRejected`、`TestAuthRateLimit_UsesRemoteAddrNotXFF`、`TestAuthRateLimit_RejectionDoesNotRevealDimension`、`TestAuthRateLimit_EmailKeyIsHMACNotPlaintext`、`TestChatRateLimit_MissingUserIDFailsClosed`、`TestLogin_RateLimitedResponseIsIdenticalForUnknownEmail`、`TestNew_SetsExplicitTimeouts`、`TestHealth_RedisProbeErrorNotEchoed`、`TestRevokeToken_TTLIncludesVerifyLeeway`、`TestRevokeUser_TokenFromNextSecondSurvives`、`TestRevokeUser_TokenFromSameSecondIsRevoked`、`TestRevokeUser_StoredNotBeforeIsWholeSecondMillis`、`TestAuth_NilClaimsFailsClosed`、`TestRun_NilLockStillScans`、`TestRelease_OnlyOwnLock`、`TestTranslateGRPCError_ResourceExhaustedIsBusy`、`TestCountsAsUnhealthy_AgentBusyIsNotUnhealthy`、`TestRetryable_AgentBusyIsNotRetried`、`TestTranslateAgentErr_AgentBusy`、`TestOnStreamError_AgentBusyMessage`、`TestFailFromError_AgentBusy`。
 
 ## 任务的最终答复
 
@@ -224,12 +226,16 @@ HTTP 回调那条路由 `dto.TaskCallbackReq.Output` 的 `max` 挡着,两条汇�
 |---|---|---|
 | `TaskQuota` | **总共**能建多少（200 / 24h） | `service/quota.go` |
 | 限流 | **多久来一个** | `middleware/ratelimit.go` |
-| 并发信号量 | **同时几个在跑** | **还没做** |
+| 并发信号量 | **同时几个在跑** | **backend 侧还没做**（Agent 侧已有第一层） |
 
 **这三样不能互相替代。** 所以「限流能不能保护 Agent」的诚实答案是：它挡得住突发脚本，
 挡不住「稳定 2/s 持续半小时 = 3600 个并发任务」。`agentclient` 那侧至今没有并发上限
 （`client.go` 只有一个 `sync.WaitGroup`），每个 `StartTask` 无条件起一个 goroutine
 持一条 gRPC 流最长 30 分钟。要管并发得上信号量，那是另一件事。
+
+Agent 侧的并发护栏（同时能跑的任务数满了就用 `RESOURCE_EXHAUSTED` 拒绝）已经把
+「接不了活」变成一次**明确的失败**，但它是**事后**的：backend 这边仍然会先把任务
+记录建出来。backend 侧的前置信号量（建任务之前查在途计数）还是另一件事，见「已知未做」。
 
 ### 五个桶
 
@@ -462,21 +468,25 @@ pending ──► running ──┐
 
 #### 错误翻译
 
-**gRPC 的 `error` 一步都不许走出 `agentclient`。** `translateGRPCError`（`errors.go`）按状态码归到五个本地哨兵：`ErrUnavailable`（Unavailable / ResourceExhausted）、`ErrTimeout`（DeadlineExceeded）、`ErrAlreadyRunning`（AlreadyExists）、`ErrBadRequest`（InvalidArgument / NotFound / FailedPrecondition / Unimplemented …）、`ErrRemoteInternal`（Internal / Unknown / DataLoss / 其余）。
+**gRPC 的 `error` 一步都不许走出 `agentclient`。** `translateGRPCError`（`errors.go`）按状态码归到本包的哨兵：`ErrUnavailable`（Unavailable）、`ErrAgentBusy`（ResourceExhausted）、`ErrTimeout`（DeadlineExceeded）、`ErrAlreadyRunning`（AlreadyExists）、`ErrBadRequest`（InvalidArgument / NotFound / FailedPrecondition / Unimplemented …）、`ErrRemoteInternal`（Internal / Unknown / DataLoss / 其余）。
 
 **`AlreadyExists` 单拎一个哨兵，别并回 `ErrBadRequest`。** 它在这条链路上只有一个来源：流断了之后原样重发，而 Agent 那边上一次的 worker 还没散场（`self._tasks.register` 挡回来的）。那是「等一下就好」，而 `ErrBadRequest` 的语义是「重试一万次也一样」。混在一起的话，重发在最常见的时序下每次都失败，而且没有任何迹象。它同样**不算下游有病**——对面健康得很。`TestSentinelFor_AlreadyExistsIsRetryable` 盯着这三条。
 
 翻译结果里**只留 op 和状态码名，绝不带 `status.Message()`**。Unavailable 的 message 长这样：`dial tcp 10.0.0.7:50051: connect: connection refused` —— 里面是内网地址，而这个 error 会经 `OnStreamError` 一路走到 `tasks.error_msg`，那一列是跟着任务详情**回显给用户**的。`TestTranslateGRPCError_DropsRawMessage` 盯着这条。丢掉原文不影响排查：状态码说明了故障类别，Agent 地址启动日志里有一份。
 
-`service.translateAgentErr` 再把哨兵翻成 `model.ErrAgentUnavailable` / `ErrAgentTimeout`，`response.errRules` 映射到 `50300` / `50400`。**别让 `response` 直接 import `agentclient`** —— 那会把响应外壳挂到 gRPC 基础设施上。
+`service.translateAgentErr` 再把哨兵翻成 `model.ErrAgentUnavailable` / `ErrAgentBusy` / `ErrAgentTimeout`，`response.errRules` 映射到 `50300` / `50301` / `50400`。**别让 `response` 直接 import `agentclient`** —— 那会把响应外壳挂到 gRPC 基础设施上。
 
-注意：这两个业务码目前**没有 HTTP 生产者**。派发失败走的是「标 `failed`、创建照样 200」（见下面的任务派发），取消通知是 best-effort，所以 Agent 挂掉不会有任何接口回 503。规则先登记好，等哪天有接口要把 Agent 错误直接抛给客户端时就是对的。
+注意：这几个业务码目前**都没有 HTTP 生产者**。派发失败走的是「标 `failed`、创建照样 200」（见下面的任务派发），取消通知是 best-effort，所以 Agent 挂掉不会有任何接口回 503。`50301`（执行器满了）更特别 —— 它是**异步**到达的：任务记录**已经建了**、派发**已经发生了**，错误要等事件流里才浮出来，于是用户看到的是任务详情里的 `error_msg`，**不是** HTTP 响应里的业务码。**别把 `50301` 读成「已经生效了」** —— 今天没有任何接口会返回它；登记它只是为了让将来有同步路径时它不掉进 `CodeInternal`（50000，那会让客户端以为服务坏了），以及让前端能区分「并发满了」和「Agent 挂了」。规则先登记好，等哪天有接口要把 Agent 错误直接抛给客户端时就是对的。
 
 #### 熔断
 
 `internal/pkg/breaker` 是个不依赖 gRPC 的三态熔断器（closed → open → half_open）。`GRPCClient` 在 `StartTask` / `CancelTask` 前 `Allow()`，拿到结果 `Record()`。
 
 **什么错误算「下游有病」由 `countsAsUnhealthy` 决定，只有 `ErrUnavailable` / `ErrTimeout` / `ErrRemoteInternal` 算。** 把 `InvalidArgument` 这类算进去的话，前端一阵坏请求就能把一个完全健康的 Agent 关在门外。
+
+**`ErrAgentBusy`（执行器满了）明确不算。** 熔断器数的是「持续出错」，不是「接不了活」—— 把它算进去，一次流量高峰就能把一个健康的 Agent 隔离掉，而 Agent 恰恰是在满载的时候最忙。`countsAsUnhealthy` 里为此显式挡了一道，别只靠"它没被列在上面"。`TestCountsAsUnhealthy_AgentBusyIsNotUnhealthy` 盯着这条。
+
+**但 busy 被记成「健康」有个副作用：它会把连续失败计数清零。** `consume` 里那句 `record(!countsAsUnhealthy(tErr))` 在 busy 时算出的是 `Record(true)` —— 方向是对的（Agent 回话了，它明确告诉你「我满了」，这证明它活着可及），但 `breaker.Record(true)` 在 closed 状态下做的第一件事就是 `b.failures = 0`（`internal/pkg/breaker/breaker.go`）。于是混流场景下（Agent 一半连不上一半满载）每次 busy 都把计数抹平，熔断器可能因此**永远打不开**。已知取舍：breaker 改成三态（healthy / unhealthy / **neutral**）是独立的一件事，不在本次范围内。
 
 **`StartTask` 那条路的 `Record` 在 `consume` 里，不在 `StartTask` 里。** `RunTask` 是 server-streaming，`c.cli.RunTask(...)` 不等对面回话就返回 —— Agent 进程没了它照样返回 nil，错误要到第一次 `Recv()` 才浮出来。按它的返回值记账的话，熔断器永远认为下游是好的，装了等于没装，而且没有任何迹象。`consume` 里那个 `recorded` 标志保证一次 `Allow` 只对一次 `Record`：多记会搞乱半开期计数，少记会让探针名额漏掉、熔断器再也回不到 closed。`TestConsume_StreamFailureOpensBreaker` 和 `TestConsume_RecordsExactlyOnce` 盯着这两条。
 
@@ -584,4 +594,4 @@ TaskService ──要──> agentclient.Client ──要──> EventHandler �
 
 回收器复用那个**不带客户端**的 `statusWriter`：它只写状态，从不联系 Agent —— 一个连不上的 Agent 正是它要处理的情况。它跑在自己的 `context.WithCancel` 上（不是请求 ctx），退出时先 `stopReconcile()` 再 `srv.Shutdown()`：它是纯后台循环，没有在途请求要照顾，让它在关闭过程中再扫一轮只会拖长关闭时间。
 
-已知未做：Agent 挂掉时**没有任何 HTTP 接口回 503**（`50300` / `50400` 的映射已经登记好，但派发失败走「标 failed + 200」、取消通知是 best-effort，两条路都不往上抛）；**限流只在配了 `REDIS_ADDR` 的部署里存在**（没配的话登录注册和建任务三条路全是裸的，只有启动时一条 Warn 兜着，见「限流」一节）；**回收器的选主和 JWT 吊销也都依赖 Redis**（没配 `REDIS_ADDR` 时没有锁，多副本会重复扫同一批任务 —— 靠 `cas` 兜底不会写错，只是白烧几次查询；吊销也不生效，被登出/禁用的令牌还能用到过期。两条都是启动时一条 Warn 兜着，见「JWT 吊销」和「心跳与回收器」那节）；**没有并发信号量**（限流挡突发不挡并发 —— `agentclient` 至今没有并发上限，稳定 5/s 持续半小时就是 9000 个在跑的任务；配额管总量、限流管速率、信号量管并发，三者不能互相替代）；**「禁用账号」这个洞仍然开着**（`revoke.RevokeUser` 写好也测了，但**没有任何生产代码调它** —— 既没有禁用用户的接口也没有改密码的接口，所以管理员把一个用户改成 disabled 之后，他现有的令牌照样能用到 `AccessTTL` 过期，和做吊销这一层之前完全一样。补齐的前提是先有那两个接口，见「JWT 吊销」一节那张表下面的 ★）；**没有 refresh token**（所以 `AccessTTL` 停在 2h，见「JWT 吊销」那节）；`Login` 里"用户不存在"分支比"口令错"少跑一次 bcrypt，存在约 160ms 的时间侧信道（代码注释里写明了）；`/internal` 目前和业务接口共用一个监听端口，生产上应该单独端口或由网关按前缀挡在公网外。
+已知未做：Agent 挂掉时**没有任何 HTTP 接口回 503**（`50300` / `50301` / `50400` 的映射已经登记好，但派发失败走「标 failed + 200」、取消通知是 best-effort，两条路都不往上抛）；**限流只在配了 `REDIS_ADDR` 的部署里存在**（没配的话登录注册和建任务三条路全是裸的，只有启动时一条 Warn 兜着，见「限流」一节）；**回收器的选主和 JWT 吊销也都依赖 Redis**（没配 `REDIS_ADDR` 时没有锁，多副本会重复扫同一批任务 —— 靠 `cas` 兜底不会写错，只是白烧几次查询；吊销也不生效，被登出/禁用的令牌还能用到过期。两条都是启动时一条 Warn 兜着，见「JWT 吊销」和「心跳与回收器」那节）；**没有 backend 侧的前置并发信号量**（并发护栏已经有**第一层**：Agent 侧同时能跑的任务数满了会立刻用 `RESOURCE_EXHAUSTED` 拒绝，backend 把它翻成 `ErrAgentBusy`、**不算**下游有病，文案也分开说「并发任务数已达上限」而不是「连接中断」。但**第二层还没有**：backend 在建任务**之前**不查在途计数，所以超额的任务会**先建出记录再失败** —— 用户看到的是一条 failed 的任务，而不是一个明确的拒绝；而且多副本部署下 backend 各数各的，除非引入 Redis 全局计数（那又要处理 slot 泄漏、超时、僵尸项）。配额管总量、限流管速率、信号量管并发，三者不能互相替代 —— 第一层只是把「静默排队 30 分钟」变成「立即失败 + 有明确原因」，没有解决「已创建即失败」）；**「禁用账号」这个洞仍然开着**（`revoke.RevokeUser` 写好也测了，但**没有任何生产代码调它** —— 既没有禁用用户的接口也没有改密码的接口，所以管理员把一个用户改成 disabled 之后，他现有的令牌照样能用到 `AccessTTL` 过期，和做吊销这一层之前完全一样。补齐的前提是先有那两个接口，见「JWT 吊销」一节那张表下面的 ★）；**没有 refresh token**（所以 `AccessTTL` 停在 2h，见「JWT 吊销」那节）；`Login` 里"用户不存在"分支比"口令错"少跑一次 bcrypt，存在约 160ms 的时间侧信道（代码注释里写明了）；`/internal` 目前和业务接口共用一个监听端口，生产上应该单独端口或由网关按前缀挡在公网外。

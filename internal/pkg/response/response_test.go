@@ -51,6 +51,34 @@ func TestFailFromError_QuotaExceeded(t *testing.T) {
 	}
 }
 
+// TestFailFromError_AgentBusy 盯着"执行器满了"这个码。
+//
+// 掉进"没登记 → 50000"的默认分支时,客户端会把它当成"服务坏了"去重试 ——
+// 而"并发满了"恰恰是最不该重试的时刻(重试不会让槽多出来,只会让更堵)。
+// 所以它必须有自己的业务码 50301,不能和 50300(执行器不可用)混成一个。
+func TestFailFromError_AgentBusy(t *testing.T) {
+	// 包一层 %w:service 那边就是这么抛的。
+	err := fmt.Errorf("接收任务事件流: %w", model.ErrAgentBusy)
+
+	status, body := fire(err)
+
+	if body.Code != CodeAgentBusy {
+		t.Fatalf("业务码 = %d, 想要 %d", body.Code, CodeAgentBusy)
+	}
+	if body.Code == CodeInternal {
+		t.Fatal("掉进了默认分支(50000),客户端会当成服务坏了去重试")
+	}
+	if body.Code == CodeUnavailable {
+		t.Fatal("和「执行器不可用」共用一个码,前端分不出「满了」和「挂了」")
+	}
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("HTTP 状态码 = %d, 想要 %d", status, http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(body.Message, "并发") {
+		t.Errorf("对外文案里没提并发: %q", body.Message)
+	}
+}
+
 // 没登记的错误一律 500,而且**绝不**把原始错误文案回给客户端 ——
 // 数据库报错的原文可能带表名、SQL 甚至连接串。
 func TestFailFromError_UnknownErrorLeaksNothing(t *testing.T) {
@@ -84,6 +112,7 @@ func TestFailFromError_KnownErrors(t *testing.T) {
 		{model.ErrTaskQuotaExceeded, CodeQuotaExceeded},
 		{model.ErrAgentUnavailable, CodeUnavailable},
 		{model.ErrAgentTimeout, CodeGatewayTimeout},
+		{model.ErrAgentBusy, CodeAgentBusy},
 	} {
 		t.Run(tc.err.Error(), func(t *testing.T) {
 			if _, body := fire(fmt.Errorf("包一层: %w", tc.err)); body.Code != tc.code {

@@ -67,6 +67,38 @@ func TestTranslateAgentErr(t *testing.T) {
 	}
 }
 
+// TestTranslateAgentErr_AgentBusy 盯着跨包边界的那一次翻译。
+//
+// 「执行器满了」必须翻成 model.ErrAgentBusy,而不是落回 ErrAgentUnavailable:
+// 两者对客户端的处置方向相反(一个等它腾空位,一个等它恢复)。
+// 翻错的后果是双重的 —— 熔断方向没错(那个在 agentclient 那边),
+// 但对外文案会把一个健康的执行器说成挂了。
+func TestTranslateAgentErr_AgentBusy(t *testing.T) {
+	got := translateAgentErr(agentclient.ErrAgentBusy)
+
+	if !errors.Is(got, model.ErrAgentBusy) {
+		t.Fatalf("translateAgentErr(ErrAgentBusy) = %v,想要 model.ErrAgentBusy", got)
+	}
+	if errors.Is(got, model.ErrAgentUnavailable) {
+		t.Fatal("归成了 ErrAgentUnavailable,「满了」和「连不上」必须分开")
+	}
+
+	// 真实调用链上错误是被 %w 包过的,直接用 == 比会漏。
+	wrapped := translateAgentErr(fmt.Errorf("接收任务事件流: %w", agentclient.ErrAgentBusy))
+	if !errors.Is(wrapped, model.ErrAgentBusy) {
+		t.Fatalf("包过一层的错翻成了 %v,想要 model.ErrAgentBusy", wrapped)
+	}
+
+	// 文案也要分开,而且是固定文案:error_msg 会跟着任务详情回显给用户。
+	msg := agentFailureReason(got)
+	if !strings.Contains(msg, "并发") {
+		t.Errorf("派发失败文案里没提并发: %q", msg)
+	}
+	if strings.Contains(msg, "不可用") {
+		t.Errorf("派发失败文案把「满了」说成了「不可用」: %q", msg)
+	}
+}
+
 // TestAgentFailureReason_DropsRawError 是这个文件里最要紧的一条。
 //
 // 派发失败的原因会写进 tasks.error_msg,而那一列**跟着任务详情回显给用户**。

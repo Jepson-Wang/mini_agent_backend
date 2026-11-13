@@ -12,13 +12,22 @@ import (
 // 这几个是本包对外暴露的失败原因。上层只认它们,不认 gRPC 的 codes ——
 // 和 Event / StartTaskReq 是同一条规矩:wire 层的东西不往业务层顶。
 //
-// 分成四个而不是一个,是因为**上层要按它们做不同的决定**:
-// 不可用可以重试、超时不知道对面做没做、参数错重试一万次也一样。
+// 分成一组而不是一个,是因为**上层要按它们做不同的决定**:
+// 不可用可以重试、满了重试也没用、超时不知道对面做没做、参数错重试一万次也一样。
 // 分不开的话,调用方只能一律当"调用失败"处理。
 var (
-	// ErrUnavailable 连不上 Agent,或者它明确说自己过载了。
+	// ErrUnavailable 连不上 Agent。
 	// 这是唯一一个"等一会儿再来大概率就好了"的类别。
 	ErrUnavailable = errors.New("执行器暂时不可用")
+
+	// ErrAgentBusy 执行器说它现在接不了活:并发任务数已达上限。
+	//
+	// 它和 ErrUnavailable 分得开,是因为这两件事**对调用方的处置完全相反**:
+	// 「连不上」说明下游出了问题,该退避、该让熔断器记账;「满了」说明
+	// 下游好得很、只是同时能跑的任务数到顶了 —— 退避不解决问题(槽不会
+	// 因为我们等一会儿而多出来),但也**绝不该**把它算成「下游有病」。
+	// 混在一起的话,一次流量高峰就能把一个健康的 Agent 隔离掉。
+	ErrAgentBusy = errors.New("执行器并发任务数已达上限")
 
 	// ErrTimeout 在我们给的时限内没等到 Agent 的回应。
 	//
@@ -83,13 +92,19 @@ func translateGRPCError(op string, err error) error {
 	return fmt.Errorf("%s: %w(gRPC %s)", op, sentinelFor(code), code)
 }
 
-// sentinelFor 把 gRPC 状态码归到四个哨兵之一。
+// sentinelFor 把 gRPC 状态码归到本包的哨兵之一。
 func sentinelFor(code codes.Code) error {
 	switch code {
-	case codes.Unavailable, codes.ResourceExhausted:
-		// ResourceExhausted 归到"不可用":对面还活着,但现在接不了活,
-		// 处置方式和连不上是一样的 —— 退避、稍后再来。
+	case codes.Unavailable:
 		return ErrUnavailable
+
+	case codes.ResourceExhausted:
+		// Agent 侧的并发护栏:同时能跑的任务数满了,它立刻用这个码拒绝。
+		//
+		// 单独一个哨兵,不并进 ErrUnavailable —— 「满了」不是「连不上」:
+		// 前者对面活得好好的,后者对面出事了。两者的处置方向相反,
+		// 合并的话熔断器会把一次流量高峰当成下游故障。
+		return ErrAgentBusy
 
 	case codes.DeadlineExceeded:
 		return ErrTimeout
@@ -129,6 +144,17 @@ func countsAsUnhealthy(err error) bool {
 	if err == nil {
 		return false
 	}
+
+	// 「满了」不算下游有病 —— 显式挡一道,别只靠"它没被列在上面"。
+	//
+	// 熔断器数的是"持续出错",不是"接不了活"。把「满了」算进去的话,
+	// 一次流量高峰就能把一个完全健康的 Agent 隔离掉 —— 而 Agent 恰恰
+	// 是在满载的时候最忙,把它摘掉只会让剩下的任务更堵,于是更满,
+	// 于是更多请求被拒。
+	if errors.Is(err, ErrAgentBusy) {
+		return false
+	}
+
 	return errors.Is(err, ErrUnavailable) ||
 		errors.Is(err, ErrTimeout) ||
 		errors.Is(err, ErrRemoteInternal)

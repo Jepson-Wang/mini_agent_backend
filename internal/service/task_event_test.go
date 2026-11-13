@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -198,6 +199,46 @@ func TestTaskEventHandler_StreamErrorFailsTheTask(t *testing.T) {
 	for _, leak := range []string{"10.0.0.7", "50051", "rpc error", "dial tcp", "Unavailable"} {
 		if strings.Contains(*got.errMsg, leak) {
 			t.Errorf("error_msg 泄露了 %q: %q", leak, *got.errMsg)
+		}
+	}
+}
+
+// TestOnStreamError_AgentBusyMessage 盯着"满了"和"断了"的文案分流。
+//
+// 执行器满了不是连接断了:前者是执行器好得很、只是同时能跑的任务数
+// 到顶了,用户过一会儿重发就行;后者是链路或者执行器出了问题。
+// 写成同一句的话,用户会在最不该放弃的时候放弃 —— 执行器正忙的时候。
+//
+// 这一条还顺带盯着:error_msg 是**跟着任务详情回显给用户**的,
+// 里面绝不能出现 gRPC 原文(地址、端口、内部细节)。
+func TestOnStreamError_AgentBusyMessage(t *testing.T) {
+	w := newFakeStatusWriter()
+	h := NewTaskEventHandler(w)
+
+	h.OnStreamError(context.Background(), evUID,
+		fmt.Errorf("接收任务事件流: %w", agentclient.ErrAgentBusy))
+
+	if len(w.calls) != 1 {
+		t.Fatalf("写库 %d 次,期望 1 次", len(w.calls))
+	}
+	got := w.calls[0]
+	if got.status != model.TaskFailed {
+		t.Fatalf("status = %q, 期望 failed", got.status)
+	}
+	if got.errMsg == nil {
+		t.Fatal("errMsg 是 nil,用户看不到任何解释")
+	}
+
+	msg := *got.errMsg
+	if strings.Contains(msg, "连接中断") {
+		t.Errorf("执行器满了却说成「连接中断」: %q", msg)
+	}
+	if !strings.Contains(msg, "并发") {
+		t.Errorf("文案里没提并发: %q", msg)
+	}
+	for _, leak := range []string{"RESOURCE_EXHAUSTED", "gRPC", "10.0.0.7", "50051"} {
+		if strings.Contains(msg, leak) {
+			t.Errorf("error_msg 泄露了 %q: %q", leak, msg)
 		}
 	}
 }

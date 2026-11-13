@@ -119,6 +119,18 @@ var errRules = []errRule{
 	{model.ErrAgentUnavailable, CodeUnavailable, "执行器暂时不可用,请稍后重试"},
 	{model.ErrAgentTimeout, CodeGatewayTimeout, "执行器响应超时,请稍后重试"},
 
+	// 执行器满了(并发任务数已达上限)。用 50301 而不是 50300:
+	// 两者对外都是"过会儿再试",但含义相反 —— 50300 是执行器连不上,
+	// 50301 是执行器好得很、只是排满了。前端要能分开:一个是等执行器
+	// 恢复,一个是等它腾出空位。
+	//
+	// **现在这条规则还轮不到建任务的 HTTP 响应上**:本次这个错误是
+	// **异步**到达的(任务已经建好,流里才报错),用户看到的是任务详情里的
+	// error_msg。登记它是为了 (a) 将来万一有同步路径返回它,不会掉进
+	// CodeInternal(50000 —— 那会让客户端以为服务坏了去重试,恰好是
+	// 并发满时最不该做的事);(b) 前端能区分「并发满了」和「Agent 挂了」。
+	{model.ErrAgentBusy, CodeAgentBusy, "执行器并发任务数已达上限,请稍后重试"},
+
 	// model.ErrSessionExists / ErrTaskExists 故意不登记:
 	// 它们意味着 ULID 撞了,属于内部故障,不该让客户端看见细节。
 }

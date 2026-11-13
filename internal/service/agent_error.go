@@ -23,6 +23,8 @@ func translateAgentErr(err error) error {
 		return nil
 	case errors.Is(err, agentclient.ErrUnavailable):
 		return model.ErrAgentUnavailable
+	case errors.Is(err, agentclient.ErrAgentBusy):
+		return model.ErrAgentBusy
 	case errors.Is(err, agentclient.ErrTimeout):
 		return model.ErrAgentTimeout
 	default:
@@ -38,9 +40,20 @@ func translateAgentErr(err error) error {
 //
 // 分开写而不是一律"执行器不可用",是因为用户能据此做不同的事:
 // 不可用 → 过会儿重发一次;超时 → 请求可能已经送到了,先去列表看看。
+//
+// **「满了」也必须单列。** 它和「不可用」对用户的意义正好相反:
+// 不可用是执行器出问题了,可能要等它恢复;满了是执行器好得很、只是
+// 同时能跑的任务数到顶了,过一会儿腾出空位就行。把两者说成同一句,
+// 用户会在最不该放弃的时候放弃(执行器正忙的时候)。
+//
+// 这里的每一句都是**固定文案**,不能拼 err.Error():error_msg 是
+// 跟着任务详情回显给用户的,拼上错误原文就是把内部文本变成对外契约。
 func agentFailureReason(err error) string {
 	if errors.Is(err, model.ErrAgentTimeout) {
 		return "任务派发超时:执行器没有在规定时间内响应"
+	}
+	if errors.Is(err, model.ErrAgentBusy) {
+		return "任务派发失败:执行器并发任务数已达上限,请稍后重试"
 	}
 	// 兜底也说"暂时不可用":派发这一步失败,对用户来说能做的动作只有重试,
 	// 再细分下去("参数不合法")既看不懂,也可能透露内部约定。

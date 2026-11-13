@@ -136,6 +136,15 @@ func (c *GRPCClient) retryable(ctx context.Context, taskUID string, attempt int,
 	case ctx.Err() != nil:
 		// streamCtx 到期(AGENT_TASK_TIMEOUT)或被取消。
 		return false
+	case errors.Is(err, ErrAgentBusy):
+		// 重试一个「满了」的任务毫无意义:槽不会因为我们重试而多出来,
+		// 反而多占一次在途名额,把后面的任务一起挤掉。
+		//
+		// **这是双保险。** 主路径其实已经被上面那条 `!gotEvent` 覆盖了 ——
+		// Agent 拒绝时一条事件都没收到,所以本来就不会重发。写这一条是
+		// 为了**显式**:万一将来拒绝的时机变了(比如先推几条事件再拒绝),
+		// 这条仍然拦得住,不用指望另一个条件一直成立。
+		return false
 	case errors.Is(err, ErrTimeout):
 		// ErrTimeout 自己的注释就写着:超时意味着请求可能已经到对面
 		// 并且正在执行,重试就是重复执行。而这条路上的超时是

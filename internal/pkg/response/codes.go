@@ -36,6 +36,17 @@ const (
 	// 全都回 500 的话,前端只能一律弹"系统错误",用户也就不会再试了。
 	CodeUnavailable = 50300
 
+	// CodeAgentBusy 执行器接不了活:并发任务数已达上限。
+	//
+	// 和 CodeUnavailable(50300)分开的理由是**处置方向相反**:50300 是
+	// 「执行器连不上」,该退避、该等它恢复;50301 是「执行器好得很、只是
+	// 排满了」,过一会儿腾出空位就行。合成一个码的话,客户端只能一律
+	// 当成「执行器挂了」,于是一个健康的执行器也一起被放弃。
+	//
+	// 同样落在 503 区间:两者对客户端都是「过会儿再试有用」,区别在
+	// 要不要隔离执行器。
+	CodeAgentBusy = 50301
+
 	// CodeGatewayTimeout 下游在时限内没回话。
 	//
 	// 特意和 CodeUnavailable 分开:超时意味着请求**可能已经送到并执行了**,
@@ -57,6 +68,7 @@ var codeText = map[int]string{
 	CodeRateLimited:      "请求过于频繁,请稍后再试",
 	CodeInternal:         "内部错误",
 	CodeUnavailable:      "服务暂时不可用,请稍后重试",
+	CodeAgentBusy:        "执行器并发任务数已达上限,请稍后重试",
 	CodeGatewayTimeout:   "服务响应超时,请稍后重试",
 }
 

@@ -45,6 +45,17 @@ var (
 	// 和 ErrAgentUnavailable 分开:超时的请求可能已经在对面跑起来了。
 	ErrAgentTimeout = errors.New("agent timeout")
 
+	// ErrAgentBusy 执行器接不了活:并发任务数已达上限。
+	//
+	// 它和 ErrAgentUnavailable 的区别是**方向**:一个是「接不了活」
+	// (对面好得很,只是同时能跑的任务数到顶了),一个是「连不上」
+	// (对面本身出事了)。前者不该被当成故障去熔断、隔离,后者该。
+	//
+	// 定在 model 而不是直接用 agentclient 的哨兵,理由同 ErrAgentUnavailable:
+	// response 包要按错误查表,让它 import agentclient 等于把响应外壳
+	// 挂到 gRPC 基础设施上。
+	ErrAgentBusy = errors.New("agent busy")
+
 	// ErrUserDisabled 账号不可登录(封禁、注销等)。
 	//
 	// 它和 ErrInvalidCredentials 分开是安全的,前提是**先校验口令再看状态**:

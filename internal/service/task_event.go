@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -171,9 +172,9 @@ func (h *TaskEventHandler) OnStreamError(ctx context.Context, taskUID string, er
 	slog.Error("与 Agent 的事件流中断,将任务标记为失败",
 		"task_uid", taskUID, "trace_id", traceID, "error", err)
 
-	// 给用户看的原因只说"连接中断",不带 err 原文 —— 那里面有
-	// 地址、端口、gRPC 内部细节,而 error_msg 是会回显给用户的。
-	msg := truncate("与执行器的连接中断", maxEventErrMsg)
+	// 给用户看的原因不带 err 原文 —— 那里面有地址、端口、gRPC 内部细节,
+	// 而 error_msg 是会回显给用户的。
+	msg := truncate(streamErrorMessage(err), maxEventErrMsg)
 
 	applied, err := h.tasks.HandleCallback(ctx, taskUID, model.TaskFailed,
 		CallbackResult{ErrorMsg: msg})
@@ -187,6 +188,22 @@ func (h *TaskEventHandler) OnStreamError(ctx context.Context, taskUID string, er
 		slog.Info("流中断时任务已是终态,不用收尾",
 			"task_uid", taskUID, "trace_id", traceID)
 	}
+}
+
+// streamErrorMessage 给流中断挑一句能落进 tasks.error_msg 的原因。
+//
+// **「并发满了」和「连接断了」必须分开说。** 前者是执行器好得很、只是
+// 同时能跑的任务数到顶了,用户过一会儿重发就行;后者是链路或者执行器
+// 出了问题。混成一句的话,用户会在最不该放弃的时候放弃 —— 执行器正忙
+// 的时候 —— 或者在最该放弃的时候不放弃。
+//
+// 两句都是固定文案,不带 err 原文:error_msg 会跟着任务详情回显给用户,
+// 原文里有内网地址、端口和 gRPC 内部细节。
+func streamErrorMessage(err error) string {
+	if errors.Is(err, agentclient.ErrAgentBusy) {
+		return "执行器并发任务数已达上限,请稍后重试"
+	}
+	return "与执行器的连接中断"
 }
 
 // ShouldRetry 回答 agentclient:这个任务的流断了,还值不值得原样重发。

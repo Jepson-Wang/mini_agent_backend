@@ -3,6 +3,7 @@ package agentclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -16,7 +17,7 @@ func TestTranslateGRPCError_MapsCodesToSentinels(t *testing.T) {
 		want error
 	}{
 		{codes.Unavailable, ErrUnavailable},
-		{codes.ResourceExhausted, ErrUnavailable},
+		{codes.ResourceExhausted, ErrAgentBusy},
 		{codes.DeadlineExceeded, ErrTimeout},
 		{codes.InvalidArgument, ErrBadRequest},
 		{codes.NotFound, ErrBadRequest},
@@ -86,7 +87,7 @@ func TestTranslateGRPCError_ContextErrors(t *testing.T) {
 // 归到"有病"那一侧的错误,攒够阈值就会把 Agent 整个隔离掉。
 func TestCountsAsUnhealthy(t *testing.T) {
 	unhealthy := []codes.Code{
-		codes.Unavailable, codes.ResourceExhausted, codes.DeadlineExceeded,
+		codes.Unavailable, codes.DeadlineExceeded,
 		codes.Internal, codes.Unknown, codes.DataLoss,
 	}
 	for _, c := range unhealthy {
@@ -108,8 +109,86 @@ func TestCountsAsUnhealthy(t *testing.T) {
 		}
 	}
 
+	// ResourceExhausted 从"有病"那一侧挪到了"健康"那一侧。
+	//
+	// 它以前和 Unavailable 一起归到 ErrUnavailable,于是"执行器满了"
+	// 被算成"执行器病了":熔断器攒够 5 次就把一个健康的 Agent 隔离掉,
+	// 而 Agent 恰恰是在满载的时候最忙 —— 把它摘掉只会更堵。
+	// 「满了 ≠ 病了」,见 TestCountsAsUnhealthy_AgentBusyIsNotUnhealthy。
+	if countsAsUnhealthy(translateGRPCError("测试", status.Error(codes.ResourceExhausted, ""))) {
+		t.Error("ResourceExhausted(执行器满了)不该算下游有病")
+	}
+
 	if countsAsUnhealthy(nil) {
 		t.Error("nil 是成功,不该算有病")
+	}
+}
+
+// TestTranslateGRPCError_ResourceExhaustedIsBusy 盯着并发护栏的那个码。
+//
+// Agent 侧同时能跑的任务数满了会用 RESOURCE_EXHAUSTED 拒绝。它以前
+// 被归到 ErrUnavailable(和「连不上」混为一谈),于是"满了"既会去开熔断
+// 器,又会被说成「执行器不可用」。两条路都要改,先钉住翻译这一侧。
+func TestTranslateGRPCError_ResourceExhaustedIsBusy(t *testing.T) {
+	got := translateGRPCError("接收任务事件流", status.Error(codes.ResourceExhausted, "并发任务数已达上限"))
+
+	if !errors.Is(got, ErrAgentBusy) {
+		t.Fatalf("ResourceExhausted 翻成了 %v,期望 ErrAgentBusy", got)
+	}
+	// 关键在"不是另一个":归回 ErrUnavailable 的话,熔断器和文案
+	// 都跟着走错方向,而上面那条用例是看不出区别的。
+	if errors.Is(got, ErrUnavailable) {
+		t.Fatalf("ResourceExhausted 被归成了 ErrUnavailable,「满了」和「连不上」必须分开")
+	}
+}
+
+// TestCountsAsUnhealthy_AgentBusyIsNotUnhealthy 是这次改动里最要紧的一条。
+//
+// 熔断器数的是「持续出错」,不是「接不了活」。把「执行器满了」算进去的
+// 后果是:一次流量高峰 → 5 次拒绝 → 熔断器打开 → 一个**完全健康**的
+// Agent 被整个隔离掉。而 Agent 恰恰是在满载的时候最忙,把它摘掉只会
+// 让剩下的任务更堵,于是更多请求被拒 —— 自己把自己推向更满。
+func TestCountsAsUnhealthy_AgentBusyIsNotUnhealthy(t *testing.T) {
+	// 走真实翻译路径:Agent 侧 abort(RESOURCE_EXHAUSTED)之后,
+	// backend 拿到的就是这个形状的错误。
+	err := translateGRPCError("接收任务事件流",
+		status.Error(codes.ResourceExhausted, "并发任务数已达上限"))
+
+	if countsAsUnhealthy(err) {
+		t.Error("执行器满了被算成了「下游有病」—— 一次流量高峰就能把健康的 Agent 隔离掉")
+	}
+
+	// 直接用哨兵也要一样:别指望"翻译路径上碰巧不匹配"。
+	if countsAsUnhealthy(ErrAgentBusy) {
+		t.Error("ErrAgentBusy 直接传进来也算成了「下游有病」")
+	}
+	// 包过一层也要一样:真实调用链上错误是被 %w 包过的。
+	if countsAsUnhealthy(fmt.Errorf("派发任务: %w", ErrAgentBusy)) {
+		t.Error("包过一层的 ErrAgentBusy 也被算成了「下游有病」")
+	}
+}
+
+// TestRetryable_AgentBusyIsNotRetried 盯着"满了不重试"。
+//
+// 重试一个「满了」的任务毫无意义:槽不会因为我们重试而多出来,反而
+// 多占一次在途名额,把后面的任务一起挤掉。
+//
+// gotEvent=true 是这里的关键:主路径上 Agent 拒绝时一条事件都没收到,
+// `!gotEvent` 那条已经拦住了。写这条显式分支是双保险 —— 万一将来
+// 拒绝的时机变了(先推几条事件再拒绝),这条仍然拦得住。
+func TestRetryable_AgentBusyIsNotRetried(t *testing.T) {
+	c, h := newConsumeClient(t, 0)
+
+	err := translateGRPCError("接收任务事件流",
+		status.Error(codes.ResourceExhausted, "并发任务数已达上限"))
+
+	if c.retryable(context.Background(), consumeUID, 0, true, err) {
+		t.Error("执行器满了还重试 —— 槽不会因为我们重试而多出来")
+	}
+
+	// handler 是放行的(它不拦),所以上面那条变红只可能是 retryable 自己拦的。
+	if h.retryAsked != 0 {
+		t.Errorf("问了一次要不要重试(%d 次),这条判断应该在 service 之前就做完", h.retryAsked)
 	}
 }
 
