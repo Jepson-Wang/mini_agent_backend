@@ -84,10 +84,27 @@ type taskStatusWriter interface {
 // 所以 OnStreamError 必须给任务收尾,否则它会永远停在 running。
 type TaskEventHandler struct {
 	tasks taskStatusWriter
+
+	// events 把每一条事件记进 task_events 表。
+	//
+	// **加这个依赖不会破坏构造环。** 环是
+	// TaskService → agentclient.Client → EventHandler → TaskService,
+	// 破在"事件处理器只用得上 HandleCallback,而那条路径根本不碰 Agent 客户端"。
+	// 事件记录器只写库,既不碰 Agent 客户端,也不反向依赖 TaskService ——
+	// 它要的只是"往表里写一行"和"通知一下订阅方"。
+	//
+	// 在此之前 thinking / tool_call / tool_result 这些进度事件**只进日志**,
+	// 前端一个字都看不到。事件表是 SSE 的权威,见 service.TaskEventService。
+	events TaskEventRecorder
 }
 
-func NewTaskEventHandler(tasks taskStatusWriter) *TaskEventHandler {
-	return &TaskEventHandler{tasks: tasks}
+// NewTaskEventHandler 组装事件处理器。
+//
+// events 传 nil 表示这个部署不记事件(比如事件表还没迁移):
+// 事件流照常工作,状态照常写,只是前端看不到进度。
+// **不因为它报错** —— 事件记录是给前端看的附加能力,不是任务执行的前提。
+func NewTaskEventHandler(tasks taskStatusWriter, events TaskEventRecorder) *TaskEventHandler {
+	return &TaskEventHandler{tasks: tasks, events: events}
 }
 
 // eventStatus 是「会改变任务状态的事件」到目标状态的映射。
@@ -110,9 +127,20 @@ var eventStatus = map[agentclient.EventType]string{
 func (h *TaskEventHandler) OnEvent(ctx context.Context, ev agentclient.Event) error {
 	traceID := trace.FromContext(ctx)
 
+	// 事件先落库,再处理状态。
+	//
+	// 顺序反过来(先处理状态、状态处理失败就不记了)的话,一条 finished
+	// 写库失败就等于这条事件彻底没了 —— 而事件表是 SSE 的**权威**,
+	// 少了它前端就永远看不到那次运行到底发生了什么。
+	//
+	// 记录失败**不往上抛**:这条路径上真正要紧的是别让后面的事件收不到。
+	// 记一条 Warn 就继续,符合"一个错误只上报一次"。
+	h.record(ctx, ev, traceID)
+
 	status, ok := eventStatus[ev.Type]
 	if !ok {
-		// 进度事件。将来要把 payload 落进消息表的话,入口就在这儿。
+		// 进度事件。它不改状态,但内容已经落进事件表了 ——
+		// 前端能靠它看到"Agent 此刻在想什么、调了什么工具"。
 		slog.Info("任务进度",
 			"task_uid", ev.TaskUID, "seq", ev.Seq,
 			"type", string(ev.Type), "trace_id", traceID)
@@ -155,6 +183,40 @@ func (h *TaskEventHandler) OnEvent(ctx context.Context, ev agentclient.Event) er
 		"task_uid", ev.TaskUID, "status", status,
 		"seq", ev.Seq, "trace_id", traceID)
 	return nil
+}
+
+// record 把一条事件写进事件表。
+//
+// 失败只记 Warn,不返回错误:事件表是"给前端看进度"的附加能力,
+// 它坏了不该把任务的状态一起带坏 —— 状态机走的是 HandleCallback,
+// 和这里完全独立。
+//
+// 顺带说清一件事:**事件表记的是"Agent 实际发了什么",不是"任务最后是什么状态"。**
+// 所以用户取消之后迟到的 finished 事件照样会被记下来 —— 那是事实,
+// 状态机那边不认它是另一回事(见 HandleCallback 的 cas)。
+// 两张表各说各的,才不会出现"日志说成功了、库里说取消了"这种没法解释的组合。
+func (h *TaskEventHandler) record(ctx context.Context, ev agentclient.Event, traceID string) {
+	if h.events == nil {
+		return
+	}
+	err := h.events.RecordEvent(ctx, TaskEventRecord{
+		TaskUID:   ev.TaskUID,
+		SessionID: ev.SessionID,
+		Seq:       ev.Seq,
+		Type:      string(ev.Type),
+		// 原始 payload,不做任何加工。事件表是 Agent 发的那一份的忠实副本,
+		// 消费方自己按 type 解 —— 两套解析逻辑迟早会漂。
+		//
+		// 截断在 service.TaskEventService.RecordEvent 里做(那是唯一入口),
+		// finished 的 payload 是 JSON {"final_response":...},被截断后可能不再是
+		// 合法 JSON:消费方必须容忍解不出来(同 outputFromPayload 那条约定)。
+		Payload: ev.Payload,
+	})
+	if err != nil {
+		slog.Warn("记录任务事件失败",
+			"task_uid", ev.TaskUID, "seq", ev.Seq,
+			"type", string(ev.Type), "trace_id", traceID, "error", err)
+	}
 }
 
 // OnStreamError 流异常结束。正常结束(EOF)不会走到这里。

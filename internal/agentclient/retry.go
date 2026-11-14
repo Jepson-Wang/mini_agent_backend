@@ -74,7 +74,9 @@ func (c *GRPCClient) runTask(ctx context.Context, req StartTaskReq,
 		// stream 为 nil 表示上一轮的重发压根没发出去(ALREADY_EXISTS),
 		// 这一轮直接去退避重发,没有流可消费。
 		if stream != nil {
-			out := c.consume(ctx, req.TaskUID, stream)
+			// session_id 跟着重发一起带:它是这次请求的固有属性,
+			// 重发的是同一个任务,自然还是同一个会话。
+			out := c.consume(ctx, req.TaskUID, req.SessionID, stream)
 			// 跨尝试累计:第一次收到过事件就证明 Agent 接住了这个任务,
 			// 这个事实不会因为后面某次重发一开头就断而失效。
 			gotEvent = gotEvent || out.gotEvent

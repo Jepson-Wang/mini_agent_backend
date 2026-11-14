@@ -79,6 +79,38 @@ func TestFailFromError_AgentBusy(t *testing.T) {
 	}
 }
 
+// TestFailFromError_SSECodesAreDistinct 盯着实时推送的两个码不许混。
+//
+// 50302（连接数满了）和 50303（功能没开）**处置方向相反**：
+// 前者该退避重试（等有连接被关掉），后者该改用轮询（重试多少次都没用）。
+// 混成一个码，客户端就会对一条根本不存在的路反复重试。
+//
+// 50300「执行器暂时不可用」更不能混 —— SSE 连接数满了跟执行器没关系。
+func TestFailFromError_SSECodesAreDistinct(t *testing.T) {
+	_, over := fire(fmt.Errorf("包一层: %w", model.ErrSSEOverloaded))
+	_, dis := fire(fmt.Errorf("包一层: %w", model.ErrSSEDisabled))
+
+	if over.Code != CodeSSEOverloaded {
+		t.Fatalf("连接数超限的业务码 = %d, 想要 %d", over.Code, CodeSSEOverloaded)
+	}
+	if dis.Code != CodeSSEDisabled {
+		t.Fatalf("功能未启用的业务码 = %d, 想要 %d", dis.Code, CodeSSEDisabled)
+	}
+	if over.Code == dis.Code {
+		t.Fatal("「连接数满了」和「功能没开」共用一个码,客户端分不出该退避重试还是该改用轮询")
+	}
+	if over.Code == CodeUnavailable || dis.Code == CodeUnavailable {
+		t.Fatal("和「执行器暂时不可用」共用一个码 —— SSE 的事跟执行器没关系,混了会让客户端去等执行器")
+	}
+	// 文案要能直接告诉客户端该做什么。
+	if !strings.Contains(dis.Message, "轮询") {
+		t.Errorf("「功能未启用」的文案里没说该改用轮询: %q", dis.Message)
+	}
+	if !strings.Contains(over.Message, "连接") {
+		t.Errorf("「连接数超限」的文案里没提连接: %q", over.Message)
+	}
+}
+
 // 没登记的错误一律 500,而且**绝不**把原始错误文案回给客户端 ——
 // 数据库报错的原文可能带表名、SQL 甚至连接串。
 func TestFailFromError_UnknownErrorLeaksNothing(t *testing.T) {
@@ -113,6 +145,8 @@ func TestFailFromError_KnownErrors(t *testing.T) {
 		{model.ErrAgentUnavailable, CodeUnavailable},
 		{model.ErrAgentTimeout, CodeGatewayTimeout},
 		{model.ErrAgentBusy, CodeAgentBusy},
+		{model.ErrSSEOverloaded, CodeSSEOverloaded},
+		{model.ErrSSEDisabled, CodeSSEDisabled},
 	} {
 		t.Run(tc.err.Error(), func(t *testing.T) {
 			if _, body := fire(fmt.Errorf("包一层: %w", tc.err)); body.Code != tc.code {

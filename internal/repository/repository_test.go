@@ -113,7 +113,7 @@ func migrateTestDB(db *gorm.DB) error {
 		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", migrateLockKey).Error; err != nil {
 			return err
 		}
-		return tx.AutoMigrate(&model.User{}, &model.Session{}, &model.Task{})
+		return tx.AutoMigrate(&model.User{}, &model.Session{}, &model.Task{}, &model.TaskEvent{})
 	})
 }
 

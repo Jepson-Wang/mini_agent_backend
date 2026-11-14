@@ -224,6 +224,17 @@ type Event struct {
 	TaskUID string
 	Type    EventType
 
+	// SessionID 是这条事件属于哪个会话。
+	//
+	// 它**不是**从事件里解出来的(proto 的 TaskEvent 里没有这一项),
+	// 而是这次请求的固有属性:StartTaskReq.SessionID 一直带在 RunTask 的
+	// 请求体里,从那儿取过来跟着事件一路走到 service。
+	//
+	// 为什么不在 service 层按 task_uid 查库拿:那会让每条事件多一次 SELECT
+	// (一次 LLM 任务几十条事件就是几十次查询),而且 session_id 本来就在
+	// 那条链上,丢掉再查回来是自找的。
+	SessionID string
+
 	// Seq 单调递增,从 1 开始,用来排序和去重。
 	Seq int64
 
@@ -277,7 +288,9 @@ var eventTypes = map[agentv1.EventType]EventType{
 
 // toEvent 把一条 protobuf 事件翻成本地事件。
 // 这是 proto 类型能走到的最远的地方,再往外一步就是业务代码了。
-func toEvent(ev *agentv1.TaskEvent) Event {
+//
+// sessionID 是这次请求带的,不是事件里的 —— 见 Event.SessionID 的注释。
+func toEvent(ev *agentv1.TaskEvent, sessionID string) Event {
 	t, ok := eventTypes[ev.Type]
 	if !ok {
 		t = EventUnknown
@@ -292,6 +305,7 @@ func toEvent(ev *agentv1.TaskEvent) Event {
 
 	return Event{
 		TaskUID:   ev.TaskUid,
+		SessionID: sessionID,
 		Type:      t,
 		Seq:       ev.Seq,
 		Payload:   ev.Payload,
@@ -453,7 +467,9 @@ func (c *GRPCClient) StartTask(ctx context.Context, req StartTaskReq) error {
 // consume 把流里的事件一条条交给 handler,直到流结束或出错。
 //
 // 它同时负责给熔断器一次(且仅一次)汇报,理由见 StartTask 上面那段注释。
-func (c *GRPCClient) consume(ctx context.Context, taskUID string,
+//
+// sessionID 是这次请求带的,跟着每条事件一起交上去 —— 见 Event.SessionID。
+func (c *GRPCClient) consume(ctx context.Context, taskUID, sessionID string,
 	stream agentv1.AgentService_RunTaskClient) streamOutcome {
 
 	// gotEvent 是重试判据的全部依据,见 runTask。
@@ -499,7 +515,7 @@ func (c *GRPCClient) consume(ctx context.Context, taskUID string,
 			continue
 		}
 
-		e := toEvent(ev)
+		e := toEvent(ev, sessionID)
 		if e.Type == EventUnknown {
 			// 照样往下发:payload 还在,消费方自己决定怎么处理。
 			// 但要留个记录,否则"对面升级了、我们没跟上"这件事没人会发现。

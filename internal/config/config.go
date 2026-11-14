@@ -37,6 +37,7 @@ type Config struct {
 	Redis     Redis     `yaml:"redis"`
 	RateLimit RateLimit `yaml:"rate_limit"`
 	JWT       JWT       `yaml:"jwt"`
+	SSE       SSE       `yaml:"sse"`
 }
 
 type Server struct {
@@ -181,6 +182,159 @@ type JWT struct {
 	AccessTTL time.Duration `yaml:"access_ttl"`
 }
 
+// SSE 是实时推送(Server-Sent Events)那一段的参数。
+//
+// 事件本身在数据库里,Redis Pub/Sub 只做「有更新了」的唤醒信号:
+// 信号丢了不丢数据,只丢实时性(还有定时轮询兜底)。
+//
+// ## 零值是"关掉"
+//
+// 别的配置段零值是"用默认值",这里不一样:SSE.Enabled 的零值(false)是"关"。
+// 这样更安全 —— 忘了接线只是没有这个功能,不会凭空开出一堆长连接。
+// 从配置文件加载的路径不受影响:默认值是开着的(见 defaults)。
+type SSE struct {
+	// Enabled 是不是开着这个功能。
+	//
+	// 关掉时路由**照常注册**,接口回 50300:前端拿到 503 会退回轮询,
+	// 而 404 会被当成「接口不存在」—— 那是误导,接口明明在,只是没开。
+	Enabled bool `yaml:"enabled"`
+
+	// PollInterval 兜底轮询的间隔。
+	//
+	// 唤醒信号可能丢(Redis 抖动、副本重启),所以除了信号还要定时读一次库。
+	// **没配 Redis 时,这是唯一的推送来源** —— SSE 仍然完全可用,
+	// 只是延迟变成一个轮询周期。
+	//
+	// 代价要知道:每条连接每个周期查一次库,总开销是**连接数乘出来的**
+	// (1000 条连接就是每秒 1000 次查询)。有 Redis 时唤醒信号是主路径,
+	// 这一层只是兜底;没 Redis 时它就是主路径,连接数得看着点。
+	PollInterval time.Duration `yaml:"poll_interval"`
+
+	// Heartbeat 心跳间隔。
+	//
+	// nginx 的 proxy_read_timeout 默认 60s,不心跳连接会被静默掐断,
+	// 而客户端分不清「服务端不说话」和「连接断了」。
+	Heartbeat time.Duration `yaml:"heartbeat"`
+
+	// MaxConnPerSession 单个会话最多几条 SSE 连接。
+	//
+	// 默认 2:同一个用户开两个标签页够用。
+	// 这是**软限制**(先查后订中间有缝),超限一个只是多占一个 goroutine。
+	MaxConnPerSession int `yaml:"max_conn_per_session"`
+
+	// MaxConnTotal 全进程最多几条 SSE 连接。
+	//
+	// 无限 SSE 连接会打爆 backend 内存(每条至少一个 goroutine + 缓冲),
+	// 所以这个闸必须有。它同样是软限制。
+	//
+	// **这是每进程的,不是全集群的**:多副本部署时实际是「副本数 × 这个值」。
+	MaxConnTotal int `yaml:"max_conn_total"`
+
+	// MaxConnPerUser 单个用户最多几条 SSE 连接。
+	//
+	// 为什么不能只有「每会话」和「全局」两个闸:一个账号拥有 N 个会话,
+	// 就能开 N × MaxConnPerSession 条连接,把这个进程的全局预算吃光,
+	// 于是**别的用户全部连不上**。那等于一个账号能替所有人做决定。
+	//
+	// 和另外两个闸一样是软限制(先查后订中间有缝)。
+	MaxConnPerUser int `yaml:"max_conn_per_user"`
+
+	// ReplayLimit 一次读多少条事件。
+	//
+	// 一批读满就接着读下一批,所以这个值只影响单次查询的大小,
+	// 不影响一条事件都不会漏。
+	ReplayLimit int `yaml:"replay_limit"`
+
+	// MaxReplayPerDrain 一轮推送最多下发多少条事件。
+	//
+	// ReplayLimit 管的是「一次查询读多少条」,这个管的是「一轮推送发多少条」。
+	// 两者分开是因为:一轮推送可能读好几批(读到读不满为止),
+	// 而一个攒了几万条事件的会话,一次重连就会把整段历史一口气写出去 ——
+	// 那是一次性的放大,单次查询上限拦不住。
+	//
+	// **超出的部分不会丢**:游标已经推进了,剩下的会在下一轮(兜底轮询或唤醒信号)
+	// 继续发。所以这个值限制的是**单轮的突发量**,不是总量。
+	MaxReplayPerDrain int `yaml:"max_replay_per_drain"`
+}
+
+// SSE 这一段的默认值。
+const (
+	// DefaultSSEPollInterval 兜底轮询间隔。
+	DefaultSSEPollInterval = time.Second
+
+	// DefaultSSEHeartbeat 心跳间隔。
+	//
+	// 15s:比 nginx 的 proxy_read_timeout(默认 60s)小得多,
+	// 留足了余量,中间还隔了好几层代理也不会被静默掐断。
+	DefaultSSEHeartbeat = 15 * time.Second
+
+	// DefaultSSEMaxConnPerSession 单会话连接数上限。
+	DefaultSSEMaxConnPerSession = 2
+
+	// DefaultSSEMaxConnTotal 全局连接数上限。
+	DefaultSSEMaxConnTotal = 1000
+
+	// DefaultSSEMaxConnPerUser 单用户连接数上限。
+	//
+	// 20:一个正常使用的人顶多同时开几个页面看任务流。
+	// 定得比「每会话 2 条」宽,因为一个人本来就可以有好几个会话;
+	// 但比「全局 1000 条」窄得多 —— 不然一个账号有 500 个会话就能吃光全局预算。
+	DefaultSSEMaxConnPerUser = 20
+
+	// DefaultSSEReplayLimit 一次读多少条事件。
+	//
+	// 和 repository 那边一次读的默认上限一样。
+	DefaultSSEReplayLimit = 200
+
+	// DefaultSSEMaxReplayPerDrain 一轮推送最多下发多少条。
+	//
+	// 1000:一轮最多读 5 批(每批 200 条)。
+	// 一次重连补发整段历史时,单轮突发量被它按住;
+	// 剩下的下一轮继续发,不会丢。
+	DefaultSSEMaxReplayPerDrain = 1000
+)
+
+// WithDefaults 返回一份把非法值换回默认值的副本。
+//
+// **SSE 这一段的 0 全都不是开关**,和限流那五层不一样:
+//
+//   - poll_interval=0 → 兜底轮询停摆。没配 Redis 时 SSE 就永远不推事件。
+//   - heartbeat=0 → 不发心跳,nginx 的 proxy_read_timeout(默认 60s)会静默掐断连接。
+//   - max_conn_*=0 → **不是「不限流」**。按字面理解会让一条连接都连不上;
+//     按「关掉这一层」理解又等于开了一个资源耗尽的口子 ——
+//     而无限 SSE 连接正是这个接口最该防的那件事。
+//   - replay_limit=0 → 一条事件都发不出去。
+//   - max_replay_per_drain=0 → 一轮推送都发不出去(游标推不动,连接等于白开)。
+//
+// 任何一个 0 都只会让这个功能「看起来配了,实际不工作」,
+// 所以一律换回默认值。真正想关掉整个功能,用 sse.enabled=false。
+//
+// Enabled 不在这里动:false 就是一个有意义的开关(关掉),不能替人做主。
+func (s SSE) WithDefaults() SSE {
+	if s.PollInterval <= 0 {
+		s.PollInterval = DefaultSSEPollInterval
+	}
+	if s.Heartbeat <= 0 {
+		s.Heartbeat = DefaultSSEHeartbeat
+	}
+	if s.MaxConnPerSession <= 0 {
+		s.MaxConnPerSession = DefaultSSEMaxConnPerSession
+	}
+	if s.MaxConnTotal <= 0 {
+		s.MaxConnTotal = DefaultSSEMaxConnTotal
+	}
+	if s.MaxConnPerUser <= 0 {
+		s.MaxConnPerUser = DefaultSSEMaxConnPerUser
+	}
+	if s.ReplayLimit <= 0 {
+		s.ReplayLimit = DefaultSSEReplayLimit
+	}
+	if s.MaxReplayPerDrain <= 0 {
+		s.MaxReplayPerDrain = DefaultSSEMaxReplayPerDrain
+	}
+	return s
+}
+
 // defaults 返回内置默认值。密钥没有默认值 —— 必须显式提供。
 func defaults() Config {
 	return Config{
@@ -213,6 +367,18 @@ func defaults() Config {
 			EmailLimit: 5, EmailWindow: time.Minute,
 			ChatGlobalLimit: 5, ChatGlobalWindow: time.Second,
 			ChatUserLimit: 10, ChatUserWindow: time.Minute,
+		},
+		// SSE 默认开着:它是增量能力,前端不用它就退回轮询,不影响主流程。
+		// 关掉它的理由应该是"这个部署的 nginx 配不对 SSE",而不是"先留着以后再说"。
+		SSE: SSE{
+			Enabled:           true,
+			PollInterval:      DefaultSSEPollInterval,
+			Heartbeat:         DefaultSSEHeartbeat,
+			MaxConnPerSession: DefaultSSEMaxConnPerSession,
+			MaxConnTotal:      DefaultSSEMaxConnTotal,
+			MaxConnPerUser:    DefaultSSEMaxConnPerUser,
+			ReplayLimit:       DefaultSSEReplayLimit,
+			MaxReplayPerDrain: DefaultSSEMaxReplayPerDrain,
 		},
 	}
 }
@@ -276,6 +442,12 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	// SSE 那一段的非法值换回默认值。
+	//
+	// 放在 Validate 之后:Validate 负责"能不能用",归一化是另一件事。
+	// 归一化放在这儿而不是 Validate 里,是为了让 Validate 保持只读 ——
+	// 一个会改参数的"校验函数"总有一天会被人误用。
+	cfg.SSE = cfg.SSE.WithDefaults()
 	return &cfg, nil
 }
 
@@ -354,6 +526,36 @@ func (c *Config) applyEnv() error {
 		}
 	}
 	setStringSlice(&c.Server.TrustedProxies, "TRUSTED_PROXIES")
+
+	// SSE。enabled 是唯一的开关,其余几个是阈值和间隔。
+	//
+	// 注意 setInt 对空值是"不覆盖",所以 SSE_MAX_CONN_TOTAL=0 是能传进来的 ——
+	// 而 0 在这一段**不是**"关掉这一层"(见 SSE.WithDefaults),
+	// Load 之后会被换回默认值。
+	if err := setBool(&c.SSE.Enabled, "SSE_ENABLED"); err != nil {
+		return err
+	}
+	if err := setDuration(&c.SSE.PollInterval, "SSE_POLL_INTERVAL"); err != nil {
+		return err
+	}
+	if err := setDuration(&c.SSE.Heartbeat, "SSE_HEARTBEAT"); err != nil {
+		return err
+	}
+	if err := setInt(&c.SSE.MaxConnPerSession, "SSE_MAX_CONN_PER_SESSION"); err != nil {
+		return err
+	}
+	if err := setInt(&c.SSE.MaxConnTotal, "SSE_MAX_CONN_TOTAL"); err != nil {
+		return err
+	}
+	if err := setInt(&c.SSE.MaxConnPerUser, "SSE_MAX_CONN_PER_USER"); err != nil {
+		return err
+	}
+	if err := setInt(&c.SSE.ReplayLimit, "SSE_REPLAY_LIMIT"); err != nil {
+		return err
+	}
+	if err := setInt(&c.SSE.MaxReplayPerDrain, "SSE_MAX_REPLAY_PER_DRAIN"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -390,6 +592,29 @@ func setInt(dst *int, env string) error {
 		return fmt.Errorf("%s=%q 不是合法的整数: %w", env, v, err)
 	}
 	*dst = n
+	return nil
+}
+
+// setBool 读布尔型环境变量。没设或是空串就不动 dst。
+//
+// 真值认 true/1/yes/on,假值认 false/0/no/off,不分大小写。
+//
+// **认不出来要报错**:一个拼错的开关比一个没配的开关危险得多 ——
+// 前者会让运维以为 SSE 关掉了(其实还开着),或者反过来以为开着(其实没开)。
+// 静默当成 false 的话,第二种情况会一直没人发现。
+func setBool(dst *bool, env string) error {
+	v := strings.TrimSpace(os.Getenv(env))
+	if v == "" {
+		return nil
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		*dst = true
+	case "0", "false", "no", "off":
+		*dst = false
+	default:
+		return fmt.Errorf("%s=%q 不是合法的布尔值(例:true / false / 1 / 0)", env, v)
+	}
 	return nil
 }
 

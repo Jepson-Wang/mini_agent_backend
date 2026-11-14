@@ -16,6 +16,12 @@ import (
 
 const evUID = "01J8ZQXK7P0000000000000000"
 
+// evSessionID 是这些事件所属的会话。
+//
+// 它必须一路带到事件里:事件表按 session_id 索引,归属校验也走
+// session_id → sessions.user_id —— 少了它,事件一条都写不进去。
+const evSessionID = "01J8ZQXK7P0000000000000001"
+
 // 哪种事件写哪个状态、哪些根本不写。
 func TestTaskEventHandler_MapsEventsToStatus(t *testing.T) {
 	for _, tc := range []struct {
@@ -34,7 +40,7 @@ func TestTaskEventHandler_MapsEventsToStatus(t *testing.T) {
 	} {
 		t.Run(string(tc.evType), func(t *testing.T) {
 			w := newFakeStatusWriter()
-			h := NewTaskEventHandler(w)
+			h := NewTaskEventHandler(w, newFakeEventRecorder())
 
 			err := h.OnEvent(context.Background(), agentclient.Event{
 				TaskUID: evUID, Type: tc.evType, Seq: 1, Payload: "内容",
@@ -74,7 +80,7 @@ func TestTaskEventHandler_NeverWritesCanceled(t *testing.T) {
 
 	// 把所有已知事件类型都过一遍,确认没有一条走出 canceled。
 	w := newFakeStatusWriter()
-	h := NewTaskEventHandler(w)
+	h := NewTaskEventHandler(w, newFakeEventRecorder())
 	for _, ev := range []agentclient.EventType{
 		agentclient.EventUnknown, agentclient.EventStarted, agentclient.EventThinking,
 		agentclient.EventToolCall, agentclient.EventToolResult,
@@ -98,7 +104,7 @@ func TestTaskEventHandler_NeverWritesCanceled(t *testing.T) {
 // 就能往库里塞几 MB,而且它还会跟着任务详情发回给用户。
 func TestTaskEventHandler_TruncatesErrorMsg(t *testing.T) {
 	w := newFakeStatusWriter()
-	h := NewTaskEventHandler(w)
+	h := NewTaskEventHandler(w, newFakeEventRecorder())
 
 	// 用汉字:按字节截会把一个汉字劈成两半,落库是乱码。
 	long := strings.Repeat("错", maxEventErrMsg+500)
@@ -123,7 +129,7 @@ func TestTaskEventHandler_TruncatesErrorMsg(t *testing.T) {
 // 成功的任务不该带失败原因,空白的原因要存 NULL 而不是空串。
 func TestTaskEventHandler_ErrMsgOnlyOnFailure(t *testing.T) {
 	w := newFakeStatusWriter()
-	h := NewTaskEventHandler(w)
+	h := NewTaskEventHandler(w, newFakeEventRecorder())
 	ctx := context.Background()
 
 	// finished 带了 payload 也不该写进 error_msg。
@@ -153,7 +159,7 @@ func TestTaskEventHandler_PropagatesWriteFailure(t *testing.T) {
 	w := newFakeStatusWriter()
 	w.err = errors.New("数据库炸了")
 
-	err := NewTaskEventHandler(w).OnEvent(context.Background(), agentclient.Event{
+	err := NewTaskEventHandler(w, newFakeEventRecorder()).OnEvent(context.Background(), agentclient.Event{
 		TaskUID: evUID, Type: agentclient.EventFinished,
 	})
 	if err == nil {
@@ -166,7 +172,7 @@ func TestTaskEventHandler_LateEventIsNotAnError(t *testing.T) {
 	w := newFakeStatusWriter()
 	w.applied = false
 
-	if err := NewTaskEventHandler(w).OnEvent(context.Background(), agentclient.Event{
+	if err := NewTaskEventHandler(w, newFakeEventRecorder()).OnEvent(context.Background(), agentclient.Event{
 		TaskUID: evUID, Type: agentclient.EventFinished,
 	}); err != nil {
 		t.Fatalf("迟到的事件不该报错: %v", err)
@@ -179,7 +185,7 @@ func TestTaskEventHandler_LateEventIsNotAnError(t *testing.T) {
 // 不收尾的话任务永远停在 running,用户界面上转圈转到天荒地老。
 func TestTaskEventHandler_StreamErrorFailsTheTask(t *testing.T) {
 	w := newFakeStatusWriter()
-	h := NewTaskEventHandler(w)
+	h := NewTaskEventHandler(w, newFakeEventRecorder())
 
 	h.OnStreamError(context.Background(), evUID,
 		errors.New(`rpc error: code = Unavailable desc = dial tcp 10.0.0.7:50051: refused`))
@@ -213,7 +219,7 @@ func TestTaskEventHandler_StreamErrorFailsTheTask(t *testing.T) {
 // 里面绝不能出现 gRPC 原文(地址、端口、内部细节)。
 func TestOnStreamError_AgentBusyMessage(t *testing.T) {
 	w := newFakeStatusWriter()
-	h := NewTaskEventHandler(w)
+	h := NewTaskEventHandler(w, newFakeEventRecorder())
 
 	h.OnStreamError(context.Background(), evUID,
 		fmt.Errorf("接收任务事件流: %w", agentclient.ErrAgentBusy))
@@ -250,7 +256,7 @@ func TestTaskEventHandler_StreamErrorDoesNotOverwriteTerminal(t *testing.T) {
 	w.applied = false // 模拟 cas 没匹配到行
 
 	// 不 panic、不重试就算过。
-	NewTaskEventHandler(w).OnStreamError(context.Background(), evUID, errors.New("断了"))
+	NewTaskEventHandler(w, newFakeEventRecorder()).OnStreamError(context.Background(), evUID, errors.New("断了"))
 
 	if len(w.calls) != 1 {
 		t.Errorf("应当只尝试一次,实际 %d 次", len(w.calls))
@@ -265,7 +271,7 @@ func TestTaskEventHandler_EndToEnd(t *testing.T) {
 	withTaskSvc(t, func(t *testing.T, s *TaskService, r *repository.Repository, _ *fakeAgent) {
 		ctx := context.Background()
 		_, uid := seedTask(t, r)
-		h := NewTaskEventHandler(s)
+		h := NewTaskEventHandler(s, newFakeEventRecorder())
 
 		if err := h.OnEvent(ctx, agentclient.Event{
 			TaskUID: uid, Type: agentclient.EventStarted, Seq: 1,
@@ -313,7 +319,7 @@ func TestTaskEventHandler_CannotReviveCanceledTask(t *testing.T) {
 			t.Fatalf("Cancel: %v", err)
 		}
 
-		h := NewTaskEventHandler(s)
+		h := NewTaskEventHandler(s, newFakeEventRecorder())
 		if err := h.OnEvent(ctx, agentclient.Event{
 			TaskUID: uid, Type: agentclient.EventFinished, Seq: 9,
 		}); err != nil {
@@ -352,7 +358,7 @@ func TestTaskEventHandler_ProgressEventsSendHeartbeat(t *testing.T) {
 	} {
 		t.Run(string(evType), func(t *testing.T) {
 			w := newFakeStatusWriter()
-			h := NewTaskEventHandler(w)
+			h := NewTaskEventHandler(w, newFakeEventRecorder())
 
 			err := h.OnEvent(context.Background(), agentclient.Event{
 				TaskUID: evUID, Type: evType, Seq: 1, Payload: "内容",
@@ -378,7 +384,7 @@ func TestTaskEventHandler_StatusEventsDoNotHeartbeat(t *testing.T) {
 	} {
 		t.Run(string(evType), func(t *testing.T) {
 			w := newFakeStatusWriter()
-			h := NewTaskEventHandler(w)
+			h := NewTaskEventHandler(w, newFakeEventRecorder())
 
 			if err := h.OnEvent(context.Background(), agentclient.Event{
 				TaskUID: evUID, Type: evType, Seq: 1,
@@ -397,7 +403,7 @@ func TestTaskEventHandler_StatusEventsDoNotHeartbeat(t *testing.T) {
 func TestTaskEventHandler_HeartbeatFailureIsSwallowed(t *testing.T) {
 	w := newFakeStatusWriter()
 	w.touchErr = errors.New("库挂了")
-	h := NewTaskEventHandler(w)
+	h := NewTaskEventHandler(w, newFakeEventRecorder())
 
 	err := h.OnEvent(context.Background(), agentclient.Event{
 		TaskUID: evUID, Type: agentclient.EventThinking, Seq: 1,
@@ -416,7 +422,7 @@ func TestTaskEventHandler_HeartbeatFailureIsSwallowed(t *testing.T) {
 // 前端的对话页才有东西可渲染 —— 在此之前这个值是被整个丢掉的。
 func TestOnEvent_FinishedCarriesFinalResponse(t *testing.T) {
 	w := newFakeStatusWriter()
-	h := NewTaskEventHandler(w)
+	h := NewTaskEventHandler(w, newFakeEventRecorder())
 
 	payload := `{"final_response":"北京今天多云,22 到 30 度。","completed":true,"used_turns":3}`
 	err := h.OnEvent(context.Background(), agentclient.Event{
@@ -451,7 +457,7 @@ func TestOnEvent_FinishedCarriesFinalResponse(t *testing.T) {
 func TestOnEvent_FinishedWithBadPayloadStillSucceeds(t *testing.T) {
 	for _, payload := range []string{"", "   ", "not json at all", "{"} {
 		w := newFakeStatusWriter()
-		h := NewTaskEventHandler(w)
+		h := NewTaskEventHandler(w, newFakeEventRecorder())
 
 		err := h.OnEvent(context.Background(), agentclient.Event{
 			TaskUID: "T1", Type: agentclient.EventFinished, Seq: 1, Payload: payload,
@@ -472,7 +478,7 @@ func TestOnEvent_FinishedWithBadPayloadStillSucceeds(t *testing.T) {
 // 用户会把报错当成答案读。
 func TestOnEvent_ErrorCarriesOnlyErrorMsg(t *testing.T) {
 	w := newFakeStatusWriter()
-	h := NewTaskEventHandler(w)
+	h := NewTaskEventHandler(w, newFakeEventRecorder())
 
 	err := h.OnEvent(context.Background(), agentclient.Event{
 		TaskUID: "T1", Type: agentclient.EventError, Seq: 2, Payload: "模型后端连不上",
@@ -513,11 +519,451 @@ func TestShouldRetry_OnlyWhenStillRunning(t *testing.T) {
 			w := newFakeStatusWriter()
 			w.running = tc.running
 			w.runningErr = tc.err
-			h := NewTaskEventHandler(w)
+			h := NewTaskEventHandler(w, newFakeEventRecorder())
 
 			if got := h.ShouldRetry(context.Background(), evUID, 0); got != tc.want {
 				t.Errorf("ShouldRetry = %v,期望 %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 事件落库
+// ---------------------------------------------------------------------------
+
+// fakeEventRecorder 是 TaskEventRecorder 的假实现,用来验
+// "事件有没有被交出来记录",跟数据库没关系。
+//
+// err 让记录失败,验它不会把事件流带崩。
+type fakeEventRecorder struct {
+	events []TaskEventRecord
+	err    error
+}
+
+func newFakeEventRecorder() *fakeEventRecorder { return &fakeEventRecorder{} }
+
+func (f *fakeEventRecorder) RecordEvent(_ context.Context, ev TaskEventRecord) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.events = append(f.events, ev)
+	return nil
+}
+
+// 进度事件以前**只进日志**,前端一个字都看不到。
+// 这条盯的是"它们现在也被记下来了" —— SSE 的全部价值都压在这一条上。
+func TestTaskEventHandler_RecordsEveryEvent(t *testing.T) {
+	for _, evType := range []agentclient.EventType{
+		agentclient.EventStarted,
+		agentclient.EventThinking,
+		agentclient.EventToolCall,
+		agentclient.EventToolResult,
+		agentclient.EventFinished,
+		agentclient.EventError,
+	} {
+		t.Run(string(evType), func(t *testing.T) {
+			w := newFakeStatusWriter()
+			rec := newFakeEventRecorder()
+			h := NewTaskEventHandler(w, rec)
+
+			if err := h.OnEvent(context.Background(), agentclient.Event{
+				TaskUID: evUID, SessionID: evSessionID, Type: evType, Seq: 3, Payload: "内容",
+			}); err != nil {
+				t.Fatalf("OnEvent: %v", err)
+			}
+
+			if len(rec.events) != 1 {
+				t.Fatalf("%s 记了 %d 条,期望 1 条", evType, len(rec.events))
+			}
+			got := rec.events[0]
+			if got.TaskUID != evUID || got.SessionID != evSessionID ||
+				got.Seq != 3 || got.Type != string(evType) || got.Payload != "内容" {
+				t.Errorf("记下来的事件 = %+v,和收到的不一致", got)
+			}
+		})
+	}
+}
+
+// 记录失败**不许**把状态处理一起带坏。
+//
+// 这是"一断全断"的反面:session_id 没带下来(或者事件表挂了)时,
+// 事件是记不下来,但任务的状态必须照常推进 ——
+// 否则一个纯附加的观察功能就能让用户的任务永远停在 running。
+func TestTaskEventHandler_RecordFailureDoesNotBreakStatus(t *testing.T) {
+	w := newFakeStatusWriter()
+	rec := newFakeEventRecorder()
+	rec.err = errors.New("事件表炸了")
+	h := NewTaskEventHandler(w, rec)
+
+	err := h.OnEvent(context.Background(), agentclient.Event{
+		TaskUID: evUID, SessionID: evSessionID, Type: agentclient.EventFinished, Seq: 1,
+	})
+	if err != nil {
+		t.Fatalf("记录失败不该往上抛: %v", err)
+	}
+	if len(w.calls) != 1 || w.calls[0].status != model.TaskSucceeded {
+		t.Errorf("状态没照常写: %+v", w.calls)
+	}
+}
+
+// 事件记录器没接上时(事件表还没迁移)不许 panic。
+func TestTaskEventHandler_NilRecorderIsFine(t *testing.T) {
+	w := newFakeStatusWriter()
+	h := NewTaskEventHandler(w, nil)
+
+	if err := h.OnEvent(context.Background(), agentclient.Event{
+		TaskUID: evUID, SessionID: evSessionID, Type: agentclient.EventThinking, Seq: 1,
+	}); err != nil {
+		t.Fatalf("OnEvent: %v", err)
+	}
+	if len(w.calls) != 0 {
+		t.Errorf("进度事件不该写状态,却写了 %d 次", len(w.calls))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TaskEventService
+// ---------------------------------------------------------------------------
+
+// fakeEventStore 是 eventStore 的内存实现。
+//
+// 它按真仓库的语义来:id 自增、按 id 升序、limit 生效。
+type fakeEventStore struct {
+	rows []model.TaskEvent
+	err  error
+}
+
+func (f *fakeEventStore) Append(_ context.Context, ev *model.TaskEvent) error {
+	if f.err != nil {
+		return f.err
+	}
+	ev.ID = int64(len(f.rows) + 1)
+	f.rows = append(f.rows, *ev)
+	return nil
+}
+
+func (f *fakeEventStore) ListSince(_ context.Context, sessionID string,
+	afterID int64, limit int) ([]model.TaskEvent, error) {
+
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []model.TaskEvent
+	for _, r := range f.rows {
+		if r.SessionID != sessionID || r.ID <= afterID {
+			continue
+		}
+		out = append(out, r)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// fakeSessionLookup 是 sessionLookup 的内存实现。
+type fakeSessionLookup struct {
+	sessions map[string]*model.Session
+	err      error
+}
+
+func (f *fakeSessionLookup) GetByID(_ context.Context, sessionID string) (*model.Session, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	s, ok := f.sessions[sessionID]
+	if !ok {
+		return nil, model.ErrSessionNotFound
+	}
+	return s, nil
+}
+
+// fakeNotifier 记下被通知的会话。panicWith 让它炸,验通知炸了也不影响记录。
+type fakeNotifier struct {
+	sessions  []string
+	panicWith any
+}
+
+func (f *fakeNotifier) Publish(_ context.Context, sessionID string) {
+	f.sessions = append(f.sessions, sessionID)
+	if f.panicWith != nil {
+		panic(f.panicWith)
+	}
+}
+
+// payload 必须截断:tool_result 的 content 可能是整个文件的内容,几百 KB。
+// 事件会落库(text 列没有上限),也会推给浏览器。
+//
+// 按**字符**截:按字节切会把汉字劈成两半,落库就是乱码。
+func TestTaskEventService_RecordEvent_TruncatesPayload(t *testing.T) {
+	store := &fakeEventStore{}
+	svc := NewTaskEventService(store, &fakeSessionLookup{}, nil)
+
+	// 用汉字:一个汉字 3 字节,按字节切和按字符切的结果差三倍。
+	long := strings.Repeat("错", maxEventPayload+500)
+	err := svc.RecordEvent(context.Background(), TaskEventRecord{
+		TaskUID: evUID, SessionID: evSessionID, Seq: 1,
+		Type: "tool_result", Payload: long,
+	})
+	if err != nil {
+		t.Fatalf("RecordEvent: %v", err)
+	}
+
+	if len(store.rows) != 1 {
+		t.Fatalf("写了 %d 行,期望 1 行", len(store.rows))
+	}
+	got := store.rows[0].Payload
+	if n := len([]rune(got)); n != maxEventPayload {
+		t.Errorf("截断后 %d 个字符,期望 %d", n, maxEventPayload)
+	}
+	if !strings.HasPrefix(got, "错") || strings.Contains(got, "�") {
+		t.Error("截断切坏了字符")
+	}
+}
+
+// 没超长的 payload 要**原样**存。
+//
+// 事件表是 Agent 发的那一份的忠实副本:消费方自己按 type 解,
+// 两套解析逻辑迟早会漂(而且去掉首尾空白等于悄悄改了内容)。
+func TestTaskEventService_RecordEvent_KeepsPayloadVerbatim(t *testing.T) {
+	store := &fakeEventStore{}
+	svc := NewTaskEventService(store, &fakeSessionLookup{}, nil)
+
+	payload := `{"final_response":"北京今天多云。","completed":true}`
+	if err := svc.RecordEvent(context.Background(), TaskEventRecord{
+		TaskUID: evUID, SessionID: evSessionID, Seq: 1, Type: "finished", Payload: payload,
+	}); err != nil {
+		t.Fatalf("RecordEvent: %v", err)
+	}
+	if store.rows[0].Payload != payload {
+		t.Errorf("payload 被改了: %q", store.rows[0].Payload)
+	}
+}
+
+// 记完要通知订阅方 —— 否则 SSE 那边只能靠轮询等。
+func TestTaskEventService_RecordEvent_NotifiesSubscriber(t *testing.T) {
+	store := &fakeEventStore{}
+	n := &fakeNotifier{}
+	svc := NewTaskEventService(store, &fakeSessionLookup{}, n)
+
+	if err := svc.RecordEvent(context.Background(), TaskEventRecord{
+		TaskUID: evUID, SessionID: evSessionID, Seq: 1, Type: "thinking", Payload: "在想",
+	}); err != nil {
+		t.Fatalf("RecordEvent: %v", err)
+	}
+	if len(n.sessions) != 1 || n.sessions[0] != evSessionID {
+		t.Errorf("通知的会话 = %v,期望 [%s]", n.sessions, evSessionID)
+	}
+}
+
+// 通知方炸了不许影响记录:事件已经在库里了,订阅方下一次唤醒
+// (或者兜底轮询)就能拿到。让它冒泡只会把整条事件流带断。
+func TestTaskEventService_RecordEvent_NotifyPanicIsSwallowed(t *testing.T) {
+	store := &fakeEventStore{}
+	n := &fakeNotifier{panicWith: "通知实现炸了"}
+	svc := NewTaskEventService(store, &fakeSessionLookup{}, n)
+
+	err := svc.RecordEvent(context.Background(), TaskEventRecord{
+		TaskUID: evUID, SessionID: evSessionID, Seq: 1, Type: "thinking",
+	})
+	if err != nil {
+		t.Fatalf("通知失败不该让记录失败: %v", err)
+	}
+	if len(store.rows) != 1 {
+		t.Errorf("事件没记上: %d 行", len(store.rows))
+	}
+}
+
+// 没有 session_id 的事件归不到任何会话上,谁也读不到 ——
+// 这是接线错误(session_id 没有一路带下来),不是正常输入。
+//
+// **必须报错而不是静默丢掉**:静默丢掉的症状是"前端什么都不来",
+// 而报错会留下一条 Warn,一眼就能看出是哪条链没接上。
+func TestTaskEventService_RecordEvent_WithoutSessionIDIsRejected(t *testing.T) {
+	store := &fakeEventStore{}
+	svc := NewTaskEventService(store, &fakeSessionLookup{}, nil)
+
+	err := svc.RecordEvent(context.Background(), TaskEventRecord{
+		TaskUID: evUID, Seq: 1, Type: "thinking",
+	})
+	if err == nil {
+		t.Fatal("缺 session_id 却返回成功")
+	}
+	if len(store.rows) != 0 {
+		t.Errorf("缺 session_id 的事件不该入库: %d 行", len(store.rows))
+	}
+}
+
+// 写库失败要交出去:调用方据此判断"这条事件没记上"。
+func TestTaskEventService_RecordEvent_WriteFailureIsReported(t *testing.T) {
+	store := &fakeEventStore{err: errors.New("库炸了")}
+	svc := NewTaskEventService(store, &fakeSessionLookup{}, nil)
+
+	err := svc.RecordEvent(context.Background(), TaskEventRecord{
+		TaskUID: evUID, SessionID: evSessionID, Seq: 1, Type: "thinking",
+	})
+	if err == nil {
+		t.Fatal("写库失败却返回成功")
+	}
+}
+
+// 别人的会话看起来就是"不存在"。
+//
+// **不许是 403**:403 和 404 分开的话,这个接口就成了一台 session_id 探测器
+// —— 拿到 403 说明这个 ID 真实存在,拿到 404 说明不存在。
+func TestTaskEventService_MustOwnSession_OtherUsersSessionLooksMissing(t *testing.T) {
+	sessions := &fakeSessionLookup{sessions: map[string]*model.Session{
+		evSessionID: {SessionID: evSessionID, UserID: 42},
+	}}
+	svc := NewTaskEventService(&fakeEventStore{}, sessions, nil)
+
+	err := svc.MustOwnSession(context.Background(), 7, evSessionID)
+	if !errors.Is(err, model.ErrSessionNotFound) {
+		t.Fatalf("err = %v,期望 %v", err, model.ErrSessionNotFound)
+	}
+}
+
+// 会话确实存在、也确实是这个用户的 → 放行。
+func TestTaskEventService_MustOwnSession_OwnSessionPasses(t *testing.T) {
+	sessions := &fakeSessionLookup{sessions: map[string]*model.Session{
+		evSessionID: {SessionID: evSessionID, UserID: 42},
+	}}
+	svc := NewTaskEventService(&fakeEventStore{}, sessions, nil)
+
+	if err := svc.MustOwnSession(context.Background(), 42, evSessionID); err != nil {
+		t.Errorf("自己的会话不该被拒: %v", err)
+	}
+}
+
+// 不存在的会话和参数非法,都归到同一个 NotFound。
+//
+// 单独给一个"参数错误"会让调用方能区分"ID 格式不对"和"ID 不属于我",
+// 而格式那关 handler 已经把过了。
+func TestTaskEventService_MustOwnSession_RejectsBadInput(t *testing.T) {
+	sessions := &fakeSessionLookup{sessions: map[string]*model.Session{
+		evSessionID: {SessionID: evSessionID, UserID: 42},
+	}}
+	svc := NewTaskEventService(&fakeEventStore{}, sessions, nil)
+
+	for _, tc := range []struct {
+		name      string
+		userID    int64
+		sessionID string
+	}{
+		{"用户 id 非法", 0, evSessionID},
+		{"用户 id 是负数", -1, evSessionID},
+		{"会话 id 是空串", 42, ""},
+		{"会话不存在", 42, "01J8ZQXK7P0000000000009999"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := svc.MustOwnSession(context.Background(), tc.userID, tc.sessionID)
+			if !errors.Is(err, model.ErrSessionNotFound) {
+				t.Errorf("err = %v,期望 %v", err, model.ErrSessionNotFound)
+			}
+		})
+	}
+}
+
+// 增量读:只给 afterID 之后的,按 id 升序。
+func TestTaskEventService_ListEvents_ReturnsIncremental(t *testing.T) {
+	store := &fakeEventStore{}
+	svc := NewTaskEventService(store, &fakeSessionLookup{}, nil)
+	ctx := context.Background()
+
+	for i := 1; i <= 3; i++ {
+		if err := svc.RecordEvent(ctx, TaskEventRecord{
+			TaskUID: evUID, SessionID: evSessionID, Seq: int64(i), Type: "thinking",
+		}); err != nil {
+			t.Fatalf("RecordEvent: %v", err)
+		}
+	}
+
+	evs, err := svc.ListEvents(ctx, evSessionID, 1, 10)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(evs) != 2 {
+		t.Fatalf("拿到 %d 条,期望 2 条(afterID=1 之后的两条)", len(evs))
+	}
+	if evs[0].ID >= evs[1].ID {
+		t.Errorf("没按 id 升序: %d 然后 %d", evs[0].ID, evs[1].ID)
+	}
+}
+
+// 依赖没接上时返回错误,不许 panic。
+//
+// "接口存在但没接好"必须和"接口不存在"分开:500 说接线坏了,
+// 404 说路由没了,混在一起排查会走错方向。
+func TestTaskEventService_NilDependenciesFailClosed(t *testing.T) {
+	svc := NewTaskEventService(nil, nil, nil)
+	ctx := context.Background()
+
+	if err := svc.RecordEvent(ctx, TaskEventRecord{
+		TaskUID: evUID, SessionID: evSessionID, Seq: 1, Type: "thinking",
+	}); err == nil {
+		t.Error("事件表没接上却返回成功")
+	}
+	if _, err := svc.ListEvents(ctx, evSessionID, 0, 10); err == nil {
+		t.Error("事件表没接上却读出了东西")
+	}
+	if err := svc.MustOwnSession(ctx, 1, evSessionID); err == nil {
+		t.Error("会话仓库没接上却校验通过")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 接真库跑一遍
+// ---------------------------------------------------------------------------
+
+// TestTaskEventHandler_EndToEnd_RecordsEvents 接真库跑一遍:
+// 事件处理器 → 真的 TaskEventService → 真的 task_events 表。
+//
+// 上面那些用的是内存实现,验的是逻辑;这条验的是真表真列真索引。
+func TestTaskEventHandler_EndToEnd_RecordsEvents(t *testing.T) {
+	r := withTx(t)
+	// task_events 表由包里的 migrateTestDB 建(和 User / Session / Task 一起),
+	// 表结构只有 model 这一处定义 —— 生产库的 AutoMigrate 用的也是同一个模型。
+	// 这里不再现建:两处各建一次的话,"测试库里的表结构"和"生产库里的表结构"
+	// 可能不一样,而测试照样绿着 —— 那是最坏的一种不一致。
+	_, sess, task := seed(t, r)
+
+	notifier := &fakeNotifier{}
+	svc := NewTaskEventService(r.TaskEvent, r.Session, notifier)
+	w := newFakeStatusWriter()
+	h := NewTaskEventHandler(w, svc)
+
+	ctx := context.Background()
+	for _, ev := range []agentclient.Event{
+		{TaskUID: task.TaskUID, SessionID: sess.SessionID, Type: agentclient.EventStarted, Seq: 1},
+		{TaskUID: task.TaskUID, SessionID: sess.SessionID, Type: agentclient.EventThinking,
+			Seq: 2, Payload: "我在想"},
+		{TaskUID: task.TaskUID, SessionID: sess.SessionID, Type: agentclient.EventFinished, Seq: 3},
+	} {
+		if err := h.OnEvent(ctx, ev); err != nil {
+			t.Fatalf("OnEvent: %v", err)
+		}
+	}
+
+	rows, err := r.TaskEvent.ListSince(ctx, sess.SessionID, 0, 10)
+	if err != nil {
+		t.Fatalf("读事件: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("事件表里有 %d 行,期望 3 行", len(rows))
+	}
+	for i, row := range rows {
+		if row.SessionID != sess.SessionID {
+			t.Errorf("第 %d 行的 session_id = %q,期望 %q", i, row.SessionID, sess.SessionID)
+		}
+		if row.TaskUID != task.TaskUID {
+			t.Errorf("第 %d 行的 task_uid = %q,期望 %q", i, row.TaskUID, task.TaskUID)
+		}
+	}
+	if rows[1].Payload != "我在想" {
+		t.Errorf("进度事件的 payload = %q,期望 %q", rows[1].Payload, "我在想")
+	}
+	if len(notifier.sessions) != 3 {
+		t.Errorf("通知了 %d 次,期望 3 次", len(notifier.sessions))
 	}
 }

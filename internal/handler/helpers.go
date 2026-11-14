@@ -2,6 +2,7 @@ package handler
 
 import (
 	"log/slog"
+	"reflect"
 
 	"github.com/gin-gonic/gin"
 
@@ -42,4 +43,28 @@ func notWired(c *gin.Context, what string) {
 		"path", c.Request.URL.Path,
 	)
 	response.Fail(c, response.CodeInternal, "")
+}
+
+// isNilDep 报告一个接口类型的依赖是不是"没接上"。
+//
+// 光判 `x == nil` 对接口参数不够用:调用方传一个 nil 的 *service.TaskEventService 时,
+// 接口本身**不是 nil**(里面装着一个 nil 指针),普通的判空全部失效 ——
+// 后面一调方法就在 nil 指针上炸,被 Recovery 兜成 500:
+// 看起来像服务故障,实际是接线 bug,排查方向一开始就走偏。
+//
+// 仓库的约定是"依赖为 nil 时一律 fail closed 返回 500,不放行、不 panic、
+// 也不退化成 404"(见 CLAUDE.md)。这个 helper 就是那条约定的实现。
+//
+// 和 service.isNilPointer 是同一个道理,只是那边在 service 包、这边在 handler 包。
+func isNilDep(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }

@@ -374,6 +374,118 @@ IP 桶永远打不满。`NewRouter` 里 `SetTrustedProxies(d.TrustedProxies)`，
 响应体字节必须完全一致。设计上天然成立（桶按提交的邮箱做 key，不查库），但**没有
 用例锁着就等于没有保证**。
 
+## 实时推送（SSE）
+
+`GET /api/v1/sessions/:id/stream` 把任务的执行过程（思考文本、调了什么工具、工具返回了什么）
+实时推给浏览器。**粒度是会话**：一个连接看全这个会话的任务流。
+
+### 地基：事件落库 = 权威，Pub/Sub 只做唤醒信号
+
+事件先写进 `task_events`，Redis Pub/Sub 只发一句「这个会话有更新了」。
+收到信号之后去读库里 `id > 游标` 的那几条，**不是「拿这条事件」**。
+
+所以信号丢了不丢数据，只丢实时性（还有兜底轮询）。没配 Redis 时退化成每
+`SSE_POLL_INTERVAL` 查一次库 —— **功能不会消失**，只是延迟变成一个轮询周期。
+这跟限流/吊销的取舍一致：没配 Redis 是合法部署。
+
+三条不能改的：
+
+- **事件表不存 `user_id`。** 归属靠 `session_id → sessions.user_id` 推。
+  少存一列就少一处可能填错的地方。
+- **续传游标必须落在本会话一条事件的 id 上。** 判据是「查 `afterID=lastID-1, limit=1`，
+  拿回来的 id 必须 == lastID」。不能拿「本会话最早的 id」比 —— 真正会漏发的是
+  「游标比本会话还晚」（事件 5、6、7 / 游标 100 时 minID=5 < 100 比出来「没问题」，
+  但读 `id > 100` 一条都拿不到）。`TestSSE_ForeignLastIDRestartsFromBeginning` 和
+  `TestSSE_ForeignLastIDInGapRestartsFromBeginning` 盯的是这两条分支。
+- **归属校验排在连接数上限之前。** 反过来的话，别人的会话在「满了」时回 503 而不是 404，
+  等于泄露这个 session_id 真实存在。
+
+### `task_events` 会一直涨，而且保存 Agent 的原始输出
+
+**这两条都要记住，它们不是可以忽略的实现细节：**
+
+- **没有保留策略。** 本轮拍板不做清理，表会一直涨。量级：一次 LLM 任务 10~50 个事件。
+- **payload 存的是 Agent 的原文。** 改动前 `thinking` / `tool_call` / `tool_result`
+  只进日志（而且日志里连 payload 都没有）；现在它们**原样落库 + 原样推给浏览器**。
+  `tool_result.content` 可能是**整个文件的内容**（`read_file` 工具），几百 KB。
+
+第二条的后果要认真对待：Agent 能读到的后端本机文件（`.env` 里的 `JWT_SECRET`、
+DB DSN 等）现在会被**长期持久化**，并回显给会话主人。这个项目对密钥泄漏极其敏感
+（JWT 吊销、账号枚举都是这个基调），而这条路径绕过了那道防线。
+
+现在的兜底只有 `maxEventPayload = 8KiB`（按字符截断，不劈汉字，在
+`service.RecordEvent` 这个**唯一入口**上做）。**这是限长，不是脱敏。**
+要做脱敏/摘要/保留期，是独立的一件事 —— 别以为有 8KiB 上限就安全了。
+
+### 连接数是三级闸
+
+每会话 / **单用户** / 全进程，都是**软限制**（先查后订中间有缝，超限一个只是多一个 goroutine）。
+
+**单用户那一级是必须有���，不能只有「每会话」和「全局」：** 一个账号拥有 N 个会话就能开
+`N × MaxConnPerSession` 条连接，把全进程的预算吃光，于是**别的用户全部连不上** ——
+那等于一个账号替所有人做决定。`Hub.CountUser` 按 user_id 跨会话计数。
+
+「全进程」不是「全集群」：多副本部署时实际是「副本数 × 这个值」。
+
+### 发布信号必须有界 —— ctx 上的超时不算数
+
+**`sse.Bus.Publish` 跑在事件发布路径上**（Agent 的 gRPC 事件流那个 goroutine），
+那条链路卡不得。而 go-redis v9 的命令路径是：
+
+```
+cn.WithReader(c.context(ctx), c.opt.ReadTimeout, ...)
+```
+
+`baseClient.context()`（redis.go:1892）在 `ContextTimeoutEnabled=false`（**默认值**）时
+把调用方的 ctx **换成 `context.Background()`** —— 于是 `context.WithTimeout(ctx, 200ms)`
+**到不了 socket**。剩下的只有 `opt.ReadTimeout`，而订阅用的那个客户端
+（`redisx.NewPubSub`）`ReadTimeout` 是 `-1`，`options.init()` 会把它归一成 `0`
+=「没有超时」。
+
+结果：Redis 半开（TCP 建立了但对端不回话）时 PUBLISH **永久阻塞**，整条事件流停摆。
+
+所以 `sse.Bus` 持有**两个**客户端：`sub` 是无超时的（订阅建立之后是长期阻塞读，
+超时一到期订阅就断），`pub` 是 `pub.WithTimeout(publishTimeout)` 的**有界视图**
+（`baseClient.withTimeout` 只改 `ReadTimeout`/`WriteTimeout`，**共享连接池**，不会多开连接）。
+**这条不变量由总线自己兜住**，不靠调用方传对客户端。
+`TestBus_PublishIsBoundedEvenOnUnboundedClient` 用一个「连上了但永远不回话」的
+TCP 服务端盯着它。
+
+订阅侧的 5s 建订阅超时是**真的**：Pub/Sub 的读写路径直接用调用方的 ctx
+（`cn.WithReader(ctx, 0, ...)`），没有 `c.context()` 那一步。
+
+### 单轮推送有上限，超出的不会丢
+
+`SSE_MAX_REPLAY_PER_DRAIN`（默认 1000）限制**一轮**推送下发多少条事件。
+一个攒了几万条事件的会话，一次重连补发历史就会把整段历史一口气写出去 ——
+那是一次性放大，单次查询的上限（`SSE_REPLAY_LIMIT`）拦不住。
+
+**上限必须在批内也管住**，不能只在批与批之间查：一次查询就能拿回 200 条，
+只查批间的话单批就把上限冲过去了。
+
+超出的**不会丢**：游标已经推进到最后一个发出去的事件，剩下的下一轮（兜底轮询或唤醒信号）
+继续发。上限按住的是**单轮的突发量**，不是总量。
+
+### 其它几条
+
+- **前端的去重键是 `(task_uid, seq)`，不是 id。** id 是库的全局自增序号，和「哪一条逻辑事件」
+  不是一回事：任务流重发时 Agent 从 `seq=1` 重新数，同一条逻辑事件会以**不同的 id**
+  再写一行、再推一帧。帧里的 data 同时带 `task_uid` 和 `seq` 就是为了这个。
+- **`sse.enabled=false` 回 `50303`，不是 `50300`。** 50300 是「执行器暂时不可用」，
+  前端会以为该等执行器恢复而反复重试一条根本不存在的路。50303 文案直说「请改用轮询」。
+  `50302` 是连接数超限。**这两个码是同步返回的**（SSE 握手阶段就被挡），前端真的会收到。
+- **握手阶段失败走统一 JSON 外壳，流阶段绝不再调 `response.Fail/OK`。** 响应头已发出，
+  改不了状态码，混 JSON 会带歪浏览器的解析器。
+- **不用 `c.Stream`。** 它依赖 `w.CloseNotify()`，而 `httptest.ResponseRecorder`
+  不实现 `http.CloseNotifier`，类型断言直接 panic。改用 `c.Request.Context().Done()`。
+- **`X-Accel-Buffering: no` 必带。** nginx 默认缓冲会把事件攒着一起发。
+- **关停顺序**：`stopReconcile()` → `close(shutdownCh)`（**必须排在 `srv.Shutdown` 之前**，
+  否则 Shutdown 等满 10s）→ `srv.Shutdown()` → `sseBus.Close()` → `ssePubSub.Close()` → 关库。
+- **依赖没注入要 fail closed 500，不许 panic。** `Deps.SSEStream` 是接口字段，
+  `SSEStream: (*service.TaskEventService)(nil)` 时接口本身不是 nil，`== nil` 判不出来 ——
+  `handler.isNilDep` 用反射认这种「有类型无值」，`service.TaskEventService` 的方法
+  也各自守了 nil 接收者。
+
 ## 测试约定
 
 - 需要 DB 的用例统一走 `withTx`：每个用例一个事务、结束回滚，天然隔离。**绕开 `withTx` 直接用包级 `testDB` 会在 `t.Parallel()` 下偶发失败。**

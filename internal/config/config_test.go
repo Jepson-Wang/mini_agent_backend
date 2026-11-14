@@ -37,6 +37,8 @@ func clearEnv(t *testing.T) {
 		"RATELIMIT_EMAIL_LIMIT", "RATELIMIT_EMAIL_WINDOW",
 		"RATELIMIT_CHAT_GLOBAL_LIMIT", "RATELIMIT_CHAT_GLOBAL_WINDOW",
 		"RATELIMIT_CHAT_USER_LIMIT", "RATELIMIT_CHAT_USER_WINDOW",
+		"SSE_ENABLED", "SSE_POLL_INTERVAL", "SSE_HEARTBEAT",
+		"SSE_MAX_CONN_PER_SESSION", "SSE_MAX_CONN_TOTAL", "SSE_REPLAY_LIMIT",
 		"TRUSTED_PROXIES",
 	} {
 		// 两步走。t.Setenv 是为了登记 cleanup,测试结束把原值还回去;
@@ -867,5 +869,221 @@ func TestLoad_BadTrustedProxyRejected(t *testing.T) {
 
 	if _, err := Load(writeYAML(t, minimalYAML)); err == nil {
 		t.Fatal("非法的可信代理条目应当让启动失败")
+	}
+}
+
+// ---- SSE ----
+
+// SSE 默认是开着的,阈值是那几个默认值。
+//
+// 默认关掉的话这个开关就成了「知道的人才会去打开」的摆设,
+// 而不知道的人正是最需要它的人。
+func TestLoad_SSEDefaults(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.SSE.Enabled {
+		t.Error("SSE 默认应当是开着的")
+	}
+	if cfg.SSE.PollInterval != time.Second {
+		t.Errorf("PollInterval = %v, 期望 1s", cfg.SSE.PollInterval)
+	}
+	if cfg.SSE.Heartbeat != 15*time.Second {
+		t.Errorf("Heartbeat = %v, 期望 15s", cfg.SSE.Heartbeat)
+	}
+	if cfg.SSE.MaxConnPerSession != 2 {
+		t.Errorf("MaxConnPerSession = %d, 期望 2", cfg.SSE.MaxConnPerSession)
+	}
+	if cfg.SSE.MaxConnTotal != 1000 {
+		t.Errorf("MaxConnTotal = %d, 期望 1000", cfg.SSE.MaxConnTotal)
+	}
+	if cfg.SSE.ReplayLimit != 200 {
+		t.Errorf("ReplayLimit = %d, 期望 200", cfg.SSE.ReplayLimit)
+	}
+}
+
+// YAML 能改 SSE 的每一项。
+func TestLoad_SSEFromYAML(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+
+	cfg, err := Load(writeYAML(t, minimalYAML+`
+sse:
+  enabled: false
+  poll_interval: "3s"
+  heartbeat: "45s"
+  max_conn_per_session: 5
+  max_conn_total: 77
+  replay_limit: 33
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SSE.Enabled {
+		t.Error("YAML 里的 enabled: false 应当生效")
+	}
+	if cfg.SSE.PollInterval != 3*time.Second {
+		t.Errorf("PollInterval = %v, 期望 3s", cfg.SSE.PollInterval)
+	}
+	if cfg.SSE.Heartbeat != 45*time.Second {
+		t.Errorf("Heartbeat = %v, 期望 45s", cfg.SSE.Heartbeat)
+	}
+	if cfg.SSE.MaxConnPerSession != 5 || cfg.SSE.MaxConnTotal != 77 {
+		t.Errorf("连接数上限 = %d/%d, 期望 5/77",
+			cfg.SSE.MaxConnPerSession, cfg.SSE.MaxConnTotal)
+	}
+	if cfg.SSE.ReplayLimit != 33 {
+		t.Errorf("ReplayLimit = %d, 期望 33", cfg.SSE.ReplayLimit)
+	}
+}
+
+// 环境变量盖住 YAML。
+func TestLoad_SSEFromEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("SSE_ENABLED", "false")
+	t.Setenv("SSE_POLL_INTERVAL", "2s")
+	t.Setenv("SSE_HEARTBEAT", "30s")
+	t.Setenv("SSE_MAX_CONN_PER_SESSION", "4")
+	t.Setenv("SSE_MAX_CONN_TOTAL", "88")
+	t.Setenv("SSE_REPLAY_LIMIT", "44")
+
+	cfg, err := Load(writeYAML(t, minimalYAML+`
+sse:
+  enabled: true
+  poll_interval: "9s"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SSE.Enabled {
+		t.Error("SSE_ENABLED=false 应当盖住 YAML")
+	}
+	if cfg.SSE.PollInterval != 2*time.Second {
+		t.Errorf("PollInterval = %v, 期望 2s", cfg.SSE.PollInterval)
+	}
+	if cfg.SSE.Heartbeat != 30*time.Second {
+		t.Errorf("Heartbeat = %v, 期望 30s", cfg.SSE.Heartbeat)
+	}
+	if cfg.SSE.MaxConnPerSession != 4 || cfg.SSE.MaxConnTotal != 88 {
+		t.Errorf("连接数上限 = %d/%d, 期望 4/88",
+			cfg.SSE.MaxConnPerSession, cfg.SSE.MaxConnTotal)
+	}
+	if cfg.SSE.ReplayLimit != 44 {
+		t.Errorf("ReplayLimit = %d, 期望 44", cfg.SSE.ReplayLimit)
+	}
+}
+
+// SSE 这一段的 0 **不是开关**,一律换回默认值。
+//
+// 和限流那五层不一样:那里的 0 是「关掉这一层」,是个有意义的开关;
+// 这里的 0 全都是「坏掉的默认值」—— 限流为 0 不是「不限流」,
+// 而是「上限为零」;轮询为 0 是「永远不推」。
+//
+// 真正想关掉整个功能,用 sse.enabled=false。
+func TestLoad_SSENonPositiveValuesFallBackToDefaults(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("SSE_POLL_INTERVAL", "0s")
+	t.Setenv("SSE_HEARTBEAT", "0s")
+	t.Setenv("SSE_MAX_CONN_PER_SESSION", "0")
+	t.Setenv("SSE_MAX_CONN_TOTAL", "-1")
+	t.Setenv("SSE_REPLAY_LIMIT", "0")
+
+	cfg, err := Load(writeYAML(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("SSE 的 0 不该挡住启动: %v", err)
+	}
+	if cfg.SSE.PollInterval != DefaultSSEPollInterval {
+		t.Errorf("PollInterval = %v, 期望换回默认值 %v", cfg.SSE.PollInterval, DefaultSSEPollInterval)
+	}
+	if cfg.SSE.Heartbeat != DefaultSSEHeartbeat {
+		t.Errorf("Heartbeat = %v, 期望换回默认值 %v", cfg.SSE.Heartbeat, DefaultSSEHeartbeat)
+	}
+	if cfg.SSE.MaxConnPerSession != DefaultSSEMaxConnPerSession {
+		t.Errorf("MaxConnPerSession = %d, 期望换回默认值 %d",
+			cfg.SSE.MaxConnPerSession, DefaultSSEMaxConnPerSession)
+	}
+	if cfg.SSE.MaxConnTotal != DefaultSSEMaxConnTotal {
+		t.Errorf("MaxConnTotal = %d, 期望换回默认值 %d",
+			cfg.SSE.MaxConnTotal, DefaultSSEMaxConnTotal)
+	}
+	if cfg.SSE.ReplayLimit != DefaultSSEReplayLimit {
+		t.Errorf("ReplayLimit = %d, 期望换回默认值 %d",
+			cfg.SSE.ReplayLimit, DefaultSSEReplayLimit)
+	}
+}
+
+// 开关拼错了要报错。
+//
+// 静默当成 false 的话,「以为开着其实没开」这种情况会一直没人发现。
+func TestLoad_BadSSEEnabledRejected(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+	t.Setenv("SSE_ENABLED", "开启")
+
+	if _, err := Load(writeYAML(t, minimalYAML)); err == nil {
+		t.Fatal("SSE_ENABLED 不是布尔值应当报错")
+	}
+}
+
+// WithDefaults 是 handler 也会调的:直接构造 config.SSE{} 的调用方
+// 不该因为忘了填而拿到一个什么都不推的配置。
+func TestSSEWithDefaults(t *testing.T) {
+	got := SSE{}.WithDefaults()
+	if got.PollInterval != DefaultSSEPollInterval ||
+		got.Heartbeat != DefaultSSEHeartbeat ||
+		got.MaxConnPerSession != DefaultSSEMaxConnPerSession ||
+		got.MaxConnTotal != DefaultSSEMaxConnTotal ||
+		got.ReplayLimit != DefaultSSEReplayLimit {
+		t.Errorf("零值没有换回默认值: %+v", got)
+	}
+	// Enabled 是有意义的开关,不能替人做主。
+	if got.Enabled {
+		t.Error("Enabled 不该被 WithDefaults 改动")
+	}
+}
+
+// 仓库里那份 configs/config.yaml 必须能加载,而且 SSE 那一段给的是真值。
+//
+// 这条用例锁住两件事:
+//   - 配置文件里的字段名没写错(Strict 模式会报出来),
+//     不用等到部署那一刻才发现配置根本读不出来;
+//   - 仓库里的默认值和代码里的默认值一致 —— 两边对不上的时候,
+//     「改了代码默认值却忘了改配置文件」这种漏配根本没人会发现。
+func TestLoad_ShippedConfigFile(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("JWT_SECRET", testSecret)
+
+	cfg, err := Load(filepath.Join("..", "..", "configs", "config.yaml"))
+	if err != nil {
+		t.Fatalf("仓库里的 configs/config.yaml 加载失败: %v", err)
+	}
+	if !cfg.SSE.Enabled {
+		t.Error("仓库里的配置应当开着 SSE")
+	}
+	if cfg.SSE.PollInterval != DefaultSSEPollInterval {
+		t.Errorf("仓库配置里的 poll_interval = %v, 代码默认值是 %v",
+			cfg.SSE.PollInterval, DefaultSSEPollInterval)
+	}
+	if cfg.SSE.Heartbeat != DefaultSSEHeartbeat {
+		t.Errorf("仓库配置里的 heartbeat = %v, 代码默认值是 %v",
+			cfg.SSE.Heartbeat, DefaultSSEHeartbeat)
+	}
+	if cfg.SSE.MaxConnPerSession != DefaultSSEMaxConnPerSession {
+		t.Errorf("仓库配置里的 max_conn_per_session = %d, 代码默认值是 %d",
+			cfg.SSE.MaxConnPerSession, DefaultSSEMaxConnPerSession)
+	}
+	if cfg.SSE.MaxConnTotal != DefaultSSEMaxConnTotal {
+		t.Errorf("仓库配置里的 max_conn_total = %d, 代码默认值是 %d",
+			cfg.SSE.MaxConnTotal, DefaultSSEMaxConnTotal)
+	}
+	if cfg.SSE.ReplayLimit != DefaultSSEReplayLimit {
+		t.Errorf("仓库配置里的 replay_limit = %d, 代码默认值是 %d",
+			cfg.SSE.ReplayLimit, DefaultSSEReplayLimit)
 	}
 }

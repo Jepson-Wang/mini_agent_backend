@@ -8,8 +8,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"github.com/Jepson-Wang/mini_agent_backend/internal/config"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/middleware"
 	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/response"
+	"github.com/Jepson-Wang/mini_agent_backend/internal/pkg/sse"
 )
 
 // Deps 是路由需要的全部外部依赖,由 main 组装好传进来。
@@ -80,6 +82,30 @@ type Deps struct {
 	//
 	// 探不通只会让 /health 报 degraded,不会 500 —— 理由见 HealthHandler.Check。
 	Redis RedisProber
+
+	// SSEStream 读会话事件。传 nil 时 SSE 路由一律 500(见 handler.notWired)。
+	//
+	// 注意:不能把一个值为 nil 的具体指针赋给这个接口字段,
+	// 那样接口本身不是 nil,下面的 nil 判断会失效(同 Limiter 的注释)。
+	//
+	// 就算真的这么干了,SSE handler 那边还有一道 isNilDep 兜着,
+	// 会回 500 而不是 panic(同 middleware.Auth 对空声明的处理)。
+	SSEStream SSEStreamService
+
+	// SSEHub 是本副本的订阅表。传 nil 时 SSE 路由一律 500 ——
+	// hub 没了,连接数上限就算不出来,那等于没有上限。
+	SSEHub *sse.Hub
+
+	// SSEConfig 是 SSE 那一段的参数。
+	//
+	// 零值表示「没开」(config.SSE.Enabled 的零值是 false)。
+	// 这是刻意的:忘了接线只是没有这个功能,不会凭空开出一堆长连接。
+	SSEConfig config.SSE
+
+	// Shutdown 是关停信号。收到后 SSE 连接会发一帧 shutdown 然后正常收尾。
+	//
+	// nil 表示不支持 —— select 一个 nil channel 会永久阻塞,那一路等于没有。
+	Shutdown <-chan struct{}
 }
 
 // NewRouter 装配路由。
@@ -187,6 +213,17 @@ func NewRouter(d Deps) *gin.Engine {
 		task := NewTaskHandler(d.Task)
 		private.GET("/tasks/:uid", task.Detail)
 		private.POST("/tasks/:uid/cancel", task.Cancel)
+
+		// 会话级的事件流。挂在私有组上,复用上面那个 middleware.Auth ——
+		// token 走 Authorization 头,和别的接口完全一致,不自己写鉴权。
+		//
+		// 路径参数是 :id,和上面那几条 /sessions/:id 同名 ——
+		// gin 要求同一层级上的路径参数同名,混用会在启动时直接 panic。
+		//
+		// enabled=false 时路由**照常注册**,由 handler 回 503:
+		// 404 会被前端当成「接口不存在」,而它明明在,只是没开。
+		sseHandler := NewSSEHandler(d.SSEStream, d.SSEHub, d.SSEConfig, d.Shutdown)
+		private.GET("/sessions/:id/stream", sseHandler.Stream)
 	}
 
 	// ---- 服务间路由:共享密钥,没有用户身份 ----

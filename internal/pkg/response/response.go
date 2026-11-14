@@ -131,6 +131,14 @@ var errRules = []errRule{
 	// 并发满时最不该做的事);(b) 前端能区分「并发满了」和「Agent 挂了」。
 	{model.ErrAgentBusy, CodeAgentBusy, "执行器并发任务数已达上限,请稍后重试"},
 
+	// 实时推送(SSE)这两条。
+	//
+	// 50302 和 50303 都是**本服务自己**的容量/开关,不是执行器的问题 ——
+	// 客户端按业务码做处置时必须能分开:50302 该退避重试(等有连接被关掉),
+	// 50303 该改用轮询(重试多少次都没用)。
+	{model.ErrSSEOverloaded, CodeSSEOverloaded, "实时连接数已达上限,请稍后重试"},
+	{model.ErrSSEDisabled, CodeSSEDisabled, "实时推送未启用,请改用轮询获取进度"},
+
 	// model.ErrSessionExists / ErrTaskExists 故意不登记:
 	// 它们意味着 ULID 撞了,属于内部故障,不该让客户端看见细节。
 }

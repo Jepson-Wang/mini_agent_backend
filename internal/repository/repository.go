@@ -10,17 +10,19 @@ import (
 type Repository struct {
 	db *gorm.DB
 
-	User    *UserRepo
-	Session *SessionRepo
-	Task    *TaskRepo
+	User      *UserRepo
+	Session   *SessionRepo
+	Task      *TaskRepo
+	TaskEvent *TaskEventRepo
 }
 
 func New(db *gorm.DB) *Repository {
 	return &Repository{
-		db:      db,
-		User:    &UserRepo{db: db},
-		Session: &SessionRepo{db: db},
-		Task:    &TaskRepo{db: db},
+		db:        db,
+		User:      &UserRepo{db: db},
+		Session:   &SessionRepo{db: db},
+		Task:      &TaskRepo{db: db},
+		TaskEvent: &TaskEventRepo{db: db},
 	}
 }
 

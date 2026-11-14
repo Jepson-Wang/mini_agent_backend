@@ -34,7 +34,7 @@ func TestToEvent_KnownTypes(t *testing.T) {
 		{"compacted", agentv1.EventType_EVENT_TYPE_COMPACTED, EventCompacted},
 	}
 	for _, c := range cases {
-		got := toEvent(&agentv1.TaskEvent{Type: c.in})
+		got := toEvent(&agentv1.TaskEvent{Type: c.in}, consumeSessionID)
 		if got.Type != c.want {
 			t.Errorf("%s: 翻成了 %q,期望 %q", c.name, got.Type, c.want)
 		}
@@ -50,7 +50,7 @@ func TestToEvent_CompactingIsNotUnknown(t *testing.T) {
 		agentv1.EventType_EVENT_TYPE_COMPACTING,
 		agentv1.EventType_EVENT_TYPE_COMPACTED,
 	} {
-		got := toEvent(&agentv1.TaskEvent{Type: typ})
+		got := toEvent(&agentv1.TaskEvent{Type: typ}, consumeSessionID)
 		if got.Type == EventUnknown {
 			t.Errorf("%s 翻成了 EventUnknown —— Go 侧没跟上新枚举", typ)
 		}
@@ -62,7 +62,7 @@ func TestToEvent_CompactingIsNotUnknown(t *testing.T) {
 // 老客户端遇到不认识的值必须落进 EventUnknown,**不能**被当成别的类型 ——
 // 误认成 finished 会让任务被判成功,那是最糟的错法。
 func TestToEvent_UnknownProtoValueDegradesToUnknown(t *testing.T) {
-	got := toEvent(&agentv1.TaskEvent{Type: agentv1.EventType(9999)})
+	got := toEvent(&agentv1.TaskEvent{Type: agentv1.EventType(9999)}, consumeSessionID)
 	if got.Type != EventUnknown {
 		t.Errorf("不认识的枚举值翻成了 %q,期望 %q", got.Type, EventUnknown)
 	}
@@ -95,7 +95,7 @@ func TestToEvent_KeepsPayloadAndTimestamp(t *testing.T) {
 		Type:      agentv1.EventType_EVENT_TYPE_COMPACTED,
 		Payload:   `{"ok":true,"boundary":42}`,
 		Timestamp: ts.UnixMilli(),
-	})
+	}, consumeSessionID)
 
 	if got.Type != EventCompacted {
 		t.Errorf("类型 = %q,期望 %q", got.Type, EventCompacted)
@@ -108,5 +108,10 @@ func TestToEvent_KeepsPayloadAndTimestamp(t *testing.T) {
 	}
 	if !got.Timestamp.Equal(ts) {
 		t.Errorf("timestamp = %v,期望 %v", got.Timestamp, ts)
+	}
+	// session_id 是从请求带上来的,翻译不许把它弄丢 ——
+	// 事件表按它索引,丢了这条事件就谁也读不到。
+	if got.SessionID != consumeSessionID {
+		t.Errorf("session_id = %q,期望 %q", got.SessionID, consumeSessionID)
 	}
 }

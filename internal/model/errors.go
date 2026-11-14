@@ -56,6 +56,23 @@ var (
 	// 挂到 gRPC 基础设施上。
 	ErrAgentBusy = errors.New("agent busy")
 
+	// ErrSSEOverloaded 实时推送的连接数已达上限。
+	//
+	// 它和 ErrAgentBusy 一样是「容量到顶」而不是「出了故障」,但说的
+	// 不是执行器而是本服务自己的 SSE 连接数。
+	//
+	// 定在 model 是因为 response 包要按错误查表:让 response 直接认
+	// handler 包里的码,等于把 HTTP 响应外壳挂到 SSE 实现上,
+	// 而 SSE 只是这条链路上的一环。
+	ErrSSEOverloaded = errors.New("sse overloaded")
+
+	// ErrSSEDisabled 这个部署没开实时推送。
+	//
+	// 和 ErrSSEOverloaded 分开是有意的:前者是「等有连接被关掉就能连」,
+	// 重试有用;这一条是「这条路在这个部署上不存在」,重试多少次都没用,
+	// 客户端该做的是改用轮询。
+	ErrSSEDisabled = errors.New("sse disabled")
+
 	// ErrUserDisabled 账号不可登录(封禁、注销等)。
 	//
 	// 它和 ErrInvalidCredentials 分开是安全的,前提是**先校验口令再看状态**:

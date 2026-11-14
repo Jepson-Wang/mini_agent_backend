@@ -83,6 +83,10 @@ func newConsumeClient(t *testing.T, threshold int) (*GRPCClient, *recordingHandl
 const (
 	consumeUID = "01J8ZQXK7P0000000000000000"
 
+	// consumeSessionID 是这次请求带的会话 id。它不从事件里来
+	// (proto 的 TaskEvent 里没有这一项),是从 StartTaskReq 一路带下来的。
+	consumeSessionID = "01J8ZQXK7P0000000000000001"
+
 	// cooldown 短到可以用一次 Sleep 跨过去。真实时钟是单调的,
 	// 睡 20 倍的时长不会抖 —— 这里不值得为了一条用例给 breaker
 	// 开一个只有测试用的时钟注入口。
@@ -105,7 +109,7 @@ func TestConsume_StreamFailureOpensBreaker(t *testing.T) {
 	if !c.breaker.Allow() {
 		t.Fatal("初始状态该放行")
 	}
-	out := c.consume(context.Background(), consumeUID,
+	out := c.consume(context.Background(), consumeUID, consumeSessionID,
 		&fakeStream{err: status.Error(codes.Unavailable, "connection refused")})
 
 	if c.breaker.State() != breaker.StateOpen {
@@ -132,7 +136,7 @@ func TestConsume_EventBeforeFailureCountsAsHealthy(t *testing.T) {
 	c, _ := newConsumeClient(t, 1)
 
 	c.breaker.Allow()
-	c.consume(context.Background(), consumeUID, &fakeStream{
+	c.consume(context.Background(), consumeUID, consumeSessionID, &fakeStream{
 		events: []*agentv1.TaskEvent{ev(1, agentv1.EventType_EVENT_TYPE_STARTED)},
 		err:    status.Error(codes.Unavailable, "connection reset"),
 	})
@@ -147,7 +151,7 @@ func TestConsume_CleanEOFCountsAsHealthy(t *testing.T) {
 	c, h := newConsumeClient(t, 1)
 
 	c.breaker.Allow()
-	out := c.consume(context.Background(), consumeUID, &fakeStream{
+	out := c.consume(context.Background(), consumeUID, consumeSessionID, &fakeStream{
 		events: []*agentv1.TaskEvent{
 			ev(1, agentv1.EventType_EVENT_TYPE_STARTED),
 			ev(2, agentv1.EventType_EVENT_TYPE_FINISHED),
@@ -175,7 +179,7 @@ func TestConsume_RecordsExactlyOnce(t *testing.T) {
 
 	// 先打开,再等到冷却期满进半开。
 	c.breaker.Allow()
-	c.consume(context.Background(), consumeUID,
+	c.consume(context.Background(), consumeUID, consumeSessionID,
 		&fakeStream{err: status.Error(codes.Unavailable, "down")})
 	if c.breaker.State() != breaker.StateOpen {
 		t.Fatalf("前置条件不成立:熔断器该是 open,实际 %v", c.breaker.State())
@@ -186,7 +190,7 @@ func TestConsume_RecordsExactlyOnce(t *testing.T) {
 		t.Fatal("冷却期满该放一个探针")
 	}
 
-	c.consume(context.Background(), consumeUID, &fakeStream{
+	c.consume(context.Background(), consumeUID, consumeSessionID, &fakeStream{
 		events: []*agentv1.TaskEvent{
 			ev(1, agentv1.EventType_EVENT_TYPE_STARTED),
 			ev(2, agentv1.EventType_EVENT_TYPE_THINKING),
@@ -207,7 +211,7 @@ func TestConsume_RecordsExactlyOnce(t *testing.T) {
 func TestConsume_DropsMismatchedTaskUID(t *testing.T) {
 	c, h := newConsumeClient(t, 0) // 不启用熔断,这条只看事件
 
-	c.consume(context.Background(), consumeUID, &fakeStream{
+	c.consume(context.Background(), consumeUID, consumeSessionID, &fakeStream{
 		events: []*agentv1.TaskEvent{
 			{TaskUid: "01J8ZQXK7P000000000000OTHER", Seq: 1,
 				Type: agentv1.EventType_EVENT_TYPE_FINISHED},
@@ -220,5 +224,43 @@ func TestConsume_DropsMismatchedTaskUID(t *testing.T) {
 	}
 	if h.events[0].Seq != 2 {
 		t.Errorf("留下的是 seq=%d,期望 2", h.events[0].Seq)
+	}
+}
+
+// TestConsume_CarriesSessionID 盯着 session_id 有没有真的走到事件里。
+//
+// 这条是 SSE 那条链的地基:事件表按 session_id 索引,归属校验也走
+// session_id → sessions.user_id。session_id 在这条链上**丢过一次** ——
+// 它一直待在 StartTaskReq 里,却没跟着事件往上传,于是每条事件都没有会话,
+// 事件表一条都写不进去,而症状是"前端什么都不来",极难排查。
+//
+// 所以这里显式验一遍:consume 交上去的每条事件都带着这次请求的 session_id。
+//
+// task_uid 一起断言:两个字段挨着,错一个就是接线写串了 ——
+// 比如哪天有人在 runTask 里把 req.SessionID 写成 req.TaskUID,
+// 只断言 SessionID 的话,单看一条用例仍然全绿(它俩长得不一样,但没人比对过),
+// 而线上表现是"归属校验过不去,前端一个事件都收不到"。
+func TestConsume_CarriesSessionID(t *testing.T) {
+	c, h := newConsumeClient(t, 0)
+
+	c.consume(context.Background(), consumeUID, consumeSessionID, &fakeStream{
+		events: []*agentv1.TaskEvent{
+			ev(1, agentv1.EventType_EVENT_TYPE_STARTED),
+			ev(2, agentv1.EventType_EVENT_TYPE_THINKING),
+		},
+	})
+
+	if len(h.events) != 2 {
+		t.Fatalf("交上来 %d 条事件,期望 2 条", len(h.events))
+	}
+	for _, e := range h.events {
+		if e.SessionID != consumeSessionID {
+			t.Errorf("seq=%d 的事件 session_id = %q,期望 %q",
+				e.Seq, e.SessionID, consumeSessionID)
+		}
+		if e.TaskUID != consumeUID {
+			t.Errorf("seq=%d 的事件 task_uid = %q,期望 %q",
+				e.Seq, e.TaskUID, consumeUID)
+		}
 	}
 }
